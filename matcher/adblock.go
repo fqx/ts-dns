@@ -88,8 +88,11 @@ func NewABPByText(text string) (matcher *ABPlus) {
 		if line == "" || line[0] == '!' || line[0] == '[' {
 			continue // 忽略空行、注释行、类型声明
 		} else if line[0] == '/' { // path类规则
-			if len(line) > 13 && line[:13] == "/^https?:\\/\\/" && line[len(line)-5:] == "\\/.*/" { // google正则补丁
-				reg := regexp.MustCompile(line[13 : len(line)-5])
+			if len(line) >= 18 && line[:13] == "/^https?:\\/\\/" && line[len(line)-5:] == "\\/.*/" { // google正则补丁
+				reg, err := regexp.Compile(line[13 : len(line)-5])
+				if err != nil {
+					continue
+				}
 				matcher.blockedRegs = append(matcher.blockedRegs, reg)
 			}
 			continue
@@ -100,8 +103,8 @@ func NewABPByText(text string) (matcher *ABPlus) {
 		// 判断域名中是否有通配符
 		if strings.Contains(domain, "*") {
 			// 通配符表达式转正则表达式
-			regStr := strings.Replace(domain, ".", "\\.", -1)
-			regStr = strings.Replace(regStr, "*", ".*", -1)
+			regStr := regexp.QuoteMeta(domain)
+			regStr = strings.ReplaceAll(regStr, `\*`, ".*")
 			regex := regexp.MustCompile("^" + regStr + "$")
 			if len(line) > 2 && line[:2] == "@@" {
 				matcher.unblockedRegs = append(matcher.unblockedRegs, regex)
@@ -144,4 +147,9 @@ func NewABPByFile(filename string, b64decode bool) (*ABPlus, error) {
 		raw = dst[:n]
 	}
 	return NewABPByText(string(raw)), nil
+}
+
+// Empty reports whether a list contains any usable rules.
+func (m *ABPlus) Empty() bool {
+	return len(m.isBlocked)+len(m.blockedRegs)+len(m.unblockedRegs) == 0
 }

@@ -68,7 +68,7 @@ func main() {
 		defer wg.Done()
 		srv := &dns.Server{Addr: addr, Net: net, Handler: handler}
 		logrus.Infof("listen on %s/%s", addr, net)
-		if err = srv.ListenAndServe(); err != nil {
+		if err := srv.ListenAndServe(); err != nil {
 			logrus.Errorf("service stopped: %+v", err)
 		}
 	}

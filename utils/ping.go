@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/sparrc/go-ping"
+	ping "github.com/prometheus-community/pro-bing"
 )
 
 // PingIP 向指定ip地址发起icmp ping/tcp ping（如tcpPort大于0），返回值为nil代表ping成功

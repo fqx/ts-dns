@@ -2,12 +2,8 @@ package outbound
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"io/ioutil"
-	"net"
-	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -69,7 +65,6 @@ func BuildGroups(globalConf config.Conf) (map[string]IGroup, error) {
 			fastestIP:     conf.FastestV4,
 			tcpPingPort:   conf.TCPPingPort,
 			ipSet:         nil,
-			stopCh:        make(chan struct{}),
 			stopped:       make(chan struct{}),
 			disableQTypes: map[uint16]bool{},
 		}
@@ -85,6 +80,20 @@ func BuildGroups(globalConf config.Conf) (map[string]IGroup, error) {
 			g.disableQTypes[dns.StringToType[qTypeStr]] = true
 		}
 
+		// Validate the refresh interval before starting any goroutines.
+		g.gfwListInterval = time.Hour
+		if conf.GFWListUpdateInterval != "" {
+			interval, err := time.ParseDuration(conf.GFWListUpdateInterval)
+			if err != nil || interval <= 0 {
+				return nil, fmt.Errorf("invalid gfwlist_update_interval %q", conf.GFWListUpdateInterval)
+			}
+			g.gfwListInterval = interval
+		}
+		if conf.GFWListURL != "" {
+			if err := validateGFWListURL(conf.GFWListURL); err != nil {
+				return nil, err
+			}
+		}
 		// read rules
 		text := strings.Join(conf.Rules, "\n")
 		g.matcher = matcher.NewABPByText(text)
@@ -186,10 +195,12 @@ type groupImpl struct {
 	name     string
 	fallback bool
 
-	disableQTypes map[uint16]bool
-	matcher       *matcher.ABPlus
-	gfwList       unsafe.Pointer // type: *matcher.ABPlus
-	gfwListURL    string
+	disableQTypes   map[uint16]bool
+	matcher         *matcher.ABPlus
+	gfwList         unsafe.Pointer // type: *matcher.ABPlus
+	gfwListURL      string
+	gfwListInterval time.Duration
+	cancelRefresh   context.CancelFunc
 
 	noCookie bool              // 是否删除请求中的cookie
 	withECS  *dns.EDNS0_SUBNET // 是否在请求中附加ECS信息
@@ -204,7 +215,6 @@ type groupImpl struct {
 	ipSet  iIPSet // 将响应中的IPv4地址加入ipset
 	ipSet6 iIPSet // 将响应中的IPv4地址加入ipset
 
-	stopCh  chan struct{}
 	stopped chan struct{}
 }
 
@@ -391,64 +401,40 @@ func (g *groupImpl) PostProcess(_ *dns.Msg, resp *dns.Msg) {
 	}
 }
 
-func (g *groupImpl) grabGFWList() *matcher.ABPlus {
-	if g.gfwListURL == "" {
-		return nil
-	}
-	client := new(http.Client)
-	client.Timeout = 10 * time.Second
-	if g.proxy != nil {
-		wrap := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return g.proxy.Dial(network, addr)
-		}
-		client.Transport = &http.Transport{DialContext: wrap}
-	}
-	// todo 自闭环解析dns
-	req, _ := http.NewRequest("GET", g.gfwListURL, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		logrus.Warnf("get gfw list %q failed: %+v", g.gfwListURL, err)
-		return nil
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		logrus.Warnf("get gfw list %q failed, status_code: %d", g.gfwListURL, resp.StatusCode)
-		return nil
-	}
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		logrus.Warnf("read gfw list %q failed, error: %+v", g.gfwListURL, err)
-		return nil
-	}
-	dst := make([]byte, base64.StdEncoding.DecodedLen(len(data)))
-	if _, err = base64.StdEncoding.Decode(data, dst); err != nil {
-		logrus.Warnf("decode gfw list %q failed, error: %+v", g.gfwListURL, err)
-		return nil
-	}
-	return matcher.NewABPByText(string(dst))
-}
-
 func (g *groupImpl) Start(resolver dns.Handler) {
 	for _, caller := range g.callers {
 		caller.Start(resolver)
 	}
-	lastSuccess := time.Unix(0, 0)
-	tick := time.NewTicker(time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	g.cancelRefresh = cancel
 	go func() {
+		defer close(g.stopped)
+		if g.gfwListURL == "" {
+			<-ctx.Done()
+			return
+		}
+		interval := g.gfwListInterval
+		if interval <= 0 {
+			interval = time.Hour
+		}
+		refresh := func() {
+			m, err := g.fetchGFWList(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					logrus.Warnf("refresh gfw list for %s failed: %v", g.name, err)
+				}
+				return
+			}
+			atomic.StorePointer(&g.gfwList, unsafe.Pointer(m))
+		}
+		refresh()
+		tick := time.NewTicker(interval)
+		defer tick.Stop()
 		for {
 			select {
 			case <-tick.C:
-				if time.Since(lastSuccess).Hours() < 1 {
-					// every hour
-					continue
-				}
-				if m := g.grabGFWList(); m != nil {
-					atomic.StorePointer(&g.gfwList, unsafe.Pointer(m))
-					lastSuccess = time.Now()
-				}
-			case <-g.stopCh:
-				close(g.stopped)
-				tick.Stop()
+				refresh()
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -457,10 +443,10 @@ func (g *groupImpl) Start(resolver dns.Handler) {
 
 func (g *groupImpl) Stop() {
 	logrus.Debugf("stop group %s", g)
+	g.cancelRefresh()
 	for _, caller := range g.callers {
 		caller.Exit()
 	}
-	close(g.stopCh)
 	<-g.stopped
 	logrus.Debugf("stop group %s success", g)
 }

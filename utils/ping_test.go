@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agiledragon/gomonkey"
+	"github.com/agiledragon/gomonkey/v2"
+	ping "github.com/prometheus-community/pro-bing"
 	"github.com/sirupsen/logrus"
-	"github.com/sparrc/go-ping"
 	"github.com/stretchr/testify/assert"
 )
 

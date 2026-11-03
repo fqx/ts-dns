@@ -1,7 +1,7 @@
 # Telescope DNS Configure File
 # https://github.com/wolf-joe/ts-dns
 
-listen = ":53"
+listen = "127.0.0.1:53"
 
 [groups]
   [groups.clean]
@@ -10,4 +10,6 @@ listen = ":53"
 
   [groups.dirty]
   dns = ["208.67.222.222:5353", "176.103.130.130:5353"]
-  gfwlist_file = "gfwlist.txt"
+  gfwlist_url = "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt"
+  gfwlist_update_interval = "24h"
+  # gfwlist_file = "gfwlist.txt"

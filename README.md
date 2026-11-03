@@ -1,10 +1,10 @@
 # Telescope DNS
 
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/wolf-joe/ts-dns)](https://github.com/wolf-joe/ts-dns/releases)
-[![Go](https://github.com/wolf-joe/ts-dns/actions/workflows/go.yml/badge.svg)](https://github.com/wolf-joe/ts-dns/actions/workflows/go.yml)
-[![codecov](https://codecov.io/gh/wolf-joe/ts-dns/branch/master/graph/badge.svg)](https://codecov.io/gh/wolf-joe/ts-dns)
-[![Go Report Card](https://goreportcard.com/badge/github.com/wolf-joe/ts-dns)](https://goreportcard.com/report/github.com/wolf-joe/ts-dns)
-![GitHub](https://img.shields.io/github/license/wolf-joe/ts-dns)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/fqx/ts-dns)](https://github.com/fqx/ts-dns/releases)
+[![Go](https://github.com/fqx/ts-dns/actions/workflows/go.yml/badge.svg)](https://github.com/fqx/ts-dns/actions/workflows/go.yml)
+[![codecov](https://codecov.io/gh/fqx/ts-dns/branch/master/graph/badge.svg)](https://codecov.io/gh/fqx/ts-dns)
+[![Go Report Card](https://goreportcard.com/badge/github.com/fqx/ts-dns)](https://goreportcard.com/report/github.com/fqx/ts-dns)
+![GitHub](https://img.shields.io/github/license/fqx/ts-dns)
 
 > 灵活快速的DNS分组转发器
 
@@ -29,7 +29,7 @@
 
 ## 使用说明
 
-1. 在[Releases页面](https://github.com/wolf-joe/ts-dns/releases)下载对应系统和平台的压缩包；
+1. 在[Releases页面](https://github.com/fqx/ts-dns/releases)下载对应系统和平台的压缩包；
 2. 解压后按需求编辑配置文件`ts-dns.toml`（可选）并运行进程：
   ```shell
   # ./ts-dns -h  # 显示命令行帮助信息
@@ -40,11 +40,11 @@
 
 ## 配置示例
 
-> 完整配置文件参见`ts-dns.full.toml`
+> 完整配置文件参见`ts-dns-full.toml`
 
 1. 默认配置（`ts-dns.toml`），开箱即用
   ```toml
-  listen = ":53"
+  listen = "127.0.0.1:53"
 
   [groups]
     [groups.clean]
@@ -99,7 +99,7 @@
     # ...
   ```
 
-7. 动态添加IPSet记录（使用前请阅读`ts-dns.full.toml`对应说明）
+7. 动态添加IPSet记录（使用前请阅读`ts-dns-full.toml`对应说明）
   ```toml
   # ...
     [groups.dirty]
@@ -111,7 +111,7 @@
 
 ## 未来规划
 
-- [ ] 支持定期拉取最新gfwlist
+- [x] 支持定期拉取最新gfwlist
 - [ ] 支持http接口管理
 - [ ] 降低gfwlist的匹配优先级
 - [ ] DoT/GFWList域名解析自闭环
@@ -119,3 +119,27 @@
 ## 特别鸣谢
 * [github.com/arloan/prdns](https://github.com/arloan/prdns)
 * [github.com/gfwlist/gfwlist](https://github.com/gfwlist/gfwlist)
+
+## GFWList 自动更新
+
+在目标组配置 `gfwlist_url` 和 `gfwlist_update_interval = "24h"`。
+间隔使用 Go duration 格式（如 `30m`、`1h`、`24h`），省略时默认为 `1h`，必须大于零。
+启动后立即异步拉取，此后按间隔更新；失败时保留上一次有效列表并在下个周期重试。
+可同时设置 `gfwlist_file` 作为启动时的本地规则，自动更新只替换内存规则，不覆盖文件。
+远程内容必须是 base64 编码的 GFWList，最大 8 MiB；推荐使用 HTTPS。
+配置重载和停止会取消当前下载。仅配置文件时不启用下载。
+首次下载完成前只使用本地文件和自定义规则；需要离线启动时应配置本地文件。
+
+## 安全部署
+
+示例默认仅监听 `127.0.0.1:53`。供局域网使用时明确设置监听地址，
+并通过主机/路由器防火墙仅允许受信任网段访问 TCP 和 UDP DNS 端口。
+本服务不提供客户端身份认证、来源 ACL 或速率限制，请勿向互联网开放递归转发服务，
+以避免被用于 DNS 放大攻击。以非特权用户运行并仅授予必要的绑定端口/ICMP/IPSet权限。
+
+## 开发与构建
+
+使用 Go 1.27 或更新版本。运行 `go test -race -gcflags=all=-l ./...` 和 `go vet ./...`。
+旧测试使用运行时函数替换，因此测试必须禁用内联；新安全回归测试使用本地服务器。
+GitHub Actions 在 push/PR 运行测试、构建和 govulncheck。
+Release workflow 可手动运行以生成构建产物；推送 `v*` 标签后才发布 GitHub Release。

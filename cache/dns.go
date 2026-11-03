@@ -6,7 +6,6 @@ import (
 	"github.com/valyala/fastrand"
 	"github.com/wolf-joe/ts-dns/config"
 	"github.com/wolf-joe/ts-dns/utils"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,7 +73,7 @@ type dnsCache struct {
 
 func (c *dnsCache) cacheKey(req *dns.Msg) string {
 	question := req.Question[0]
-	key := question.Name + strconv.FormatInt(int64(question.Qtype), 10)
+	key := fmt.Sprintf("%s|%d|%d|%t|%t|%t|%t", question.Name, question.Qtype, question.Qclass, req.CheckingDisabled, req.IsEdns0() != nil && req.IsEdns0().Do(), req.AuthenticatedData, req.RecursionDesired)
 	if subnet := utils.FormatECS(req); subnet != "" {
 		key += "." + subnet
 	}
@@ -82,7 +81,7 @@ func (c *dnsCache) cacheKey(req *dns.Msg) string {
 }
 
 func (c *dnsCache) Get(req *dns.Msg) *dns.Msg {
-	if c.maxSize <= 0 {
+	if c.maxSize <= 0 || !cacheableQuery(req) {
 		return nil
 	}
 	// check cache
@@ -103,7 +102,10 @@ func (c *dnsCache) Get(req *dns.Msg) *dns.Msg {
 		return nil
 	}
 	r := item.resp.Copy()
-	r.SetReply(req)
+	r.Id = req.Id
+	r.Question = append([]dns.Question(nil), req.Question...)
+	r.RecursionDesired = req.RecursionDesired
+	r.CheckingDisabled = req.CheckingDisabled
 	for i := 0; i < len(r.Answer); i++ {
 		r.Answer[i].Header().Ttl = uint32(ttl)
 	}
@@ -124,7 +126,7 @@ func (c *dnsCache) Get(req *dns.Msg) *dns.Msg {
 }
 
 func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg) {
-	if c.maxSize <= 0 || resp == nil || len(resp.Answer) == 0 {
+	if c.maxSize <= 0 || !cacheableQuery(req) || resp == nil || len(resp.Answer) == 0 {
 		return
 	}
 	// check size
@@ -151,7 +153,7 @@ func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg) {
 	// set cache
 	expiredAt := time.Now().Add(expire).Unix()
 	c.lock.Lock()
-	c.items[key] = cacheItem{resp: resp, expiredAt: expiredAt}
+	c.items[key] = cacheItem{resp: resp.Copy(), expiredAt: expiredAt}
 	c.lock.Unlock()
 }
 
@@ -187,4 +189,23 @@ func (c *dnsCache) Start(_cleanTick ...time.Duration) {
 func (c *dnsCache) Stop() {
 	close(c.stopCh)
 	<-c.stopped
+}
+
+// Queries with client-specific EDNS options or signatures must not share answers.
+func cacheableQuery(req *dns.Msg) bool {
+	if req == nil || len(req.Question) != 1 || req.Opcode != dns.OpcodeQuery {
+		return false
+	}
+	for _, rr := range req.Extra {
+		opt, ok := rr.(*dns.OPT)
+		if !ok || opt.Version() != 0 {
+			return false
+		}
+		for _, option := range opt.Option {
+			if _, ok := option.(*dns.EDNS0_SUBNET); !ok {
+				return false
+			}
+		}
+	}
+	return true
 }

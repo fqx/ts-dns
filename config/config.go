@@ -27,11 +27,12 @@ type Group struct {
 	ECS           string   `toml:"ecs"`
 	NoCookie      bool     `toml:"no_cookie"`
 
-	Rules       []string `toml:"rules"`
-	RulesFile   string   `toml:"rules_file"`
-	GFWListFile string   `toml:"gfwlist_file"`
-	GFWListURL  string   `toml:"gfwlist_url"`
-	Fallback    bool     `toml:"fallback"`
+	Rules                 []string `toml:"rules"`
+	RulesFile             string   `toml:"rules_file"`
+	GFWListFile           string   `toml:"gfwlist_file"`
+	GFWListURL            string   `toml:"gfwlist_url"`
+	GFWListUpdateInterval string   `toml:"gfwlist_update_interval"`
+	Fallback              bool     `toml:"fallback"`
 
 	Socks5 string   `toml:"socks5"`
 	DNS    []string `toml:"dns"`

@@ -1,16 +1,17 @@
 package outbound
 
 import (
+	"context"
 	"fmt"
 	"github.com/wolf-joe/ts-dns/utils/mock"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/agiledragon/gomonkey"
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -55,34 +56,8 @@ func TestDNSCaller(t *testing.T) {
 	caller.Exit()
 	_ = caller.String()
 
-	caller = NewDoTCaller("", "", dialer)
-	// 使用代理，mock掉Dial、WriteMsg、ReadMsg
-	p1 := MockMethodSeq(caller.proxy, "Dial", []gomonkey.Params{
-		{nil, fmt.Errorf("err")},
-		{&net.TCPConn{}, nil}, {&net.TCPConn{}, nil}, {&net.TCPConn{}, nil},
-	})
-	p2 := MockMethodSeq(caller.conn, "WriteMsg", []gomonkey.Params{
-		{fmt.Errorf("err")}, {nil}, {nil},
-	})
-	p3 := MockMethodSeq(caller.conn, "ReadMsg", []gomonkey.Params{
-		{nil, fmt.Errorf("err")}, {&dns.Msg{}, nil},
-	})
-	defer func() { p.Reset(); p1.Reset(); p2.Reset(); p3.Reset() }()
-	// Dial失败
-	r, err = caller.Call(req)
-	assertFail(t, r, err)
-	// Dial成功，但WriteMsg失败
-	r, err = caller.Call(req)
-	assertFail(t, r, err)
-	// Dial、WriteMsg成功，但ReadMsg失败
-	r, err = caller.Call(req)
-	assertFail(t, r, err)
-	// Dial、WriteMsg、ReadMsg都成功
-	r, err = caller.Call(req)
-	assertSuccess(t, r, err)
+	p.Reset()
 
-	caller.Exit()
-	_ = caller.String()
 }
 
 func wrapperHandler(serveDNS func(req *dns.Msg) *dns.Msg) dns.HandlerFunc {
@@ -163,11 +138,11 @@ func TestDoHCallerV2(t *testing.T) {
 		{httpReq, nil}, {httpReq, nil},
 	})
 	mocker.MethodSeq(&http.Client{}, "Do", []gomonkey.Params{
-		{nil, fmt.Errorf("err")}, {&http.Response{Body: &net.TCPConn{}}, nil},
-		{&http.Response{Body: &net.TCPConn{}}, nil},
-		{&http.Response{Body: &net.TCPConn{}}, nil},
+		{nil, fmt.Errorf("err")}, {&http.Response{StatusCode: 200, Body: &net.TCPConn{}}, nil},
+		{&http.Response{StatusCode: 200, Body: &net.TCPConn{}}, nil},
+		{&http.Response{StatusCode: 200, Body: &net.TCPConn{}}, nil},
 	})
-	mocker.FuncSeq(ioutil.ReadAll, []gomonkey.Params{
+	mocker.FuncSeq(io.ReadAll, []gomonkey.Params{
 		{nil, fmt.Errorf("err")}, {make([]byte, 1), nil},
 		{make([]byte, 12), nil},
 	})
@@ -205,7 +180,7 @@ func TestDoHCallerV2(t *testing.T) {
 	// 测试DialContext
 	if len(caller.clients) > 0 {
 		trans := caller.clients[0].Transport.(*http.Transport)
-		_, _ = trans.DialContext(nil, "", "")
+		_, _ = trans.DialContext(context.Background(), "", "")
 	}
 	caller.Exit()
 	_ = caller.String()

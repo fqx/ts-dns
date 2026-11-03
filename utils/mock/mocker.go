@@ -3,7 +3,7 @@ package mock
 import (
 	"reflect"
 
-	"github.com/agiledragon/gomonkey"
+	"github.com/agiledragon/gomonkey/v2"
 )
 
 // Mocker gomonkey的封装

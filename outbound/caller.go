@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"github.com/wolf-joe/ts-dns/utils"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,7 +39,6 @@ type DNSCaller struct {
 	client *dns.Client
 	server string
 	proxy  proxy.Dialer
-	conn   *dns.Conn
 }
 
 func (caller *DNSCaller) Start(_ dns.Handler) {}
@@ -50,22 +49,40 @@ func (caller *DNSCaller) Call(request *dns.Msg) (r *dns.Msg, err error) {
 		r, _, err = caller.client.Exchange(request, caller.server)
 		return
 	}
-	// 通过代理连接代理服务器
-	var proxyConn net.Conn
-	if proxyConn, err = caller.proxy.Dial("tcp", caller.server); err != nil {
+	timeout := caller.client.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	d, ok := caller.proxy.(proxy.ContextDialer)
+	if !ok {
+		return nil, errors.New("DNS proxy must support context cancellation")
+	}
+	proxyConn, err := d.DialContext(ctx, "tcp", caller.server)
+	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = proxyConn.Close() }()
-	// 打包连接
-	caller.conn.Conn = proxyConn
-	if caller.client.TLSConfig != nil { // dns over tls
-		caller.conn.Conn = tls.Client(proxyConn, caller.client.TLSConfig)
-	}
-	// 发送dns请求
-	if err = caller.conn.WriteMsg(request); err != nil {
+	defer proxyConn.Close()
+	deadline, _ := ctx.Deadline()
+	if err := proxyConn.SetDeadline(deadline); err != nil {
 		return nil, err
 	}
-	return caller.conn.ReadMsg()
+	conn := &dns.Conn{Conn: proxyConn}
+	if caller.client.TLSConfig != nil {
+		conn.Conn = tls.Client(proxyConn, caller.client.TLSConfig)
+	}
+	if err := conn.WriteMsg(request); err != nil {
+		return nil, err
+	}
+	resp, err := conn.ReadMsg()
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDNSResponse(request, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // Exit caller退出时行为
@@ -79,13 +96,13 @@ func (caller *DNSCaller) String() string {
 // NewDNSCaller 创建一个UDP/TCP Caller，需要服务器地址（ip+端口）、网络类型（udp、tcp），可选代理
 func NewDNSCaller(server, network string, proxy proxy.Dialer) *DNSCaller {
 	client := &dns.Client{Net: network}
-	return &DNSCaller{client: client, server: server, proxy: proxy, conn: &dns.Conn{}}
+	return &DNSCaller{client: client, server: server, proxy: proxy}
 }
 
 // NewDoTCaller 创建一个DoT Caller，需要服务器地址（ip+端口）、证书名称，可选代理
 func NewDoTCaller(server, serverName string, proxy proxy.Dialer) *DNSCaller {
 	client := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{ServerName: serverName}}
-	return &DNSCaller{client: client, server: server, proxy: proxy, conn: &dns.Conn{}}
+	return &DNSCaller{client: client, server: server, proxy: proxy}
 }
 
 // DoHCallerV2 DoT请求类，通过resolver自动解析域名
@@ -134,15 +151,18 @@ func (caller *DoHCallerV2) run(resolveCycle time.Duration, timeout time.Duration
 // 使用resolver，将host解析成ipv4并生成clients
 func (caller *DoHCallerV2) resolve(srcReq *dns.Msg, timeout time.Duration) {
 	genClient := func(ip string) *http.Client {
-		return &http.Client{Transport: &http.Transport{
+		return &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (conn net.Conn, err error) {
 				addr := ip + ":" + caller.port // 重写addr
-				return caller.dialer.Dial(network, addr)
+				if d, ok := caller.dialer.(proxy.ContextDialer); ok {
+					return d.DialContext(ctx, network, addr)
+				}
+				return nil, errors.New("DoH dialer must support context cancellation")
 			},
 		}}
 	}
 	name := caller.host + "."
-	if srcReq != nil && len(srcReq.Question) > 0 && srcReq.Question[0].Name == name {
+	if srcReq != nil && len(srcReq.Question) > 0 && strings.EqualFold(srcReq.Question[0].Name, name) {
 		logrus.Errorf("%s resolve recursive", caller)
 		return // 可能是回环解析：DoHCaller想通过ts-dns解析自身域名，但ts-dns将请求转发回DoHCaller
 	}
@@ -227,14 +247,23 @@ func (caller *DoHCallerV2) Call(request *dns.Msg) (r *dns.Msg, err error) {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH HTTP status %d", resp.StatusCode)
+	}
 	// 解包http响应
 	var body []byte
-	if body, err = ioutil.ReadAll(resp.Body); err != nil {
+	if body, err = io.ReadAll(io.LimitReader(resp.Body, dns.MaxMsgSize+1)); err != nil {
 		return nil, err
+	}
+	if len(body) > dns.MaxMsgSize {
+		return nil, errors.New("DoH response exceeds DNS size limit")
 	}
 	// 打包dns响应
 	msg := new(dns.Msg)
 	if err = msg.Unpack(body); err != nil {
+		return nil, err
+	}
+	if err := validateDNSResponse(request, msg); err != nil {
 		return nil, err
 	}
 	return msg, nil
@@ -264,7 +293,7 @@ func NewDoHCallerV2(rawURL string, dialer proxy.Dialer) (*DoHCallerV2, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !u.IsAbs() {
+	if !u.IsAbs() || u.Scheme != "https" || u.Hostname() == "" || u.User != nil {
 		return nil, fmt.Errorf("rawURL should be abs url")
 	}
 	// 提取host、port
@@ -285,4 +314,17 @@ func NewDoHCallerV2(rawURL string, dialer proxy.Dialer) (*DoHCallerV2, error) {
 	caller.satisfyCh = make(chan interface{}, 1)
 	caller.cancelCh = make(chan interface{}, 1)
 	return caller, nil
+}
+
+func validateDNSResponse(req, resp *dns.Msg) error {
+	if resp == nil || !resp.Response || resp.Id != req.Id || resp.Opcode != req.Opcode || len(resp.Question) != len(req.Question) {
+		return errors.New("invalid DNS response")
+	}
+	for i, q := range req.Question {
+		r := resp.Question[i]
+		if !strings.EqualFold(q.Name, r.Name) || q.Qtype != r.Qtype || q.Qclass != r.Qclass {
+			return errors.New("DNS response question mismatch")
+		}
+	}
+	return nil
 }

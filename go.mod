@@ -1,27 +1,24 @@
 module github.com/wolf-joe/ts-dns
 
-go 1.17
+go 1.27.0
 
 require (
-	github.com/BurntSushi/toml v1.2.1
-	github.com/agiledragon/gomonkey v2.0.1+incompatible
-	github.com/miekg/dns v1.1.50
-	github.com/sirupsen/logrus v1.9.0
-	github.com/sparrc/go-ping v0.0.0-20190613174326-4e5b6552494c
-	github.com/stretchr/testify v1.7.0
-	github.com/valyala/fastrand v1.0.0
+	github.com/BurntSushi/toml v1.6.0
+	github.com/agiledragon/gomonkey/v2 v2.14.4
+	github.com/miekg/dns v1.1.73
+	github.com/prometheus-community/pro-bing v0.9.1
+	github.com/sirupsen/logrus v1.10.2
+	github.com/stretchr/testify v1.12.1
+	github.com/valyala/fastrand v1.1.0
 	github.com/wolf-joe/go-ipset v0.0.0-20221126092954-3bc3b2576989
 	github.com/yl2chen/cidranger v1.0.2
-	golang.org/x/net v0.0.0-20210726213435-c6fcb2dbf985
+	golang.org/x/net v0.62.0
 )
 
 require (
-	github.com/coreos/go-semver v0.3.0 // indirect
-	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/pmezard/go-difflib v1.0.0 // indirect
-	golang.org/x/mod v0.4.2 // indirect
-	golang.org/x/sys v0.0.0-20220715151400-c0bba94af5f8 // indirect
-	golang.org/x/tools v0.1.6-0.20210726203631-07bc1bf47fb2 // indirect
-	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
-	gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c // indirect
+	github.com/coreos/go-semver v0.3.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.6 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 )

@@ -1,84 +1,36 @@
-# This is an example goreleaser.yaml file with some sane defaults.
-# Make sure to check the documentation at http://goreleaser.com
-before:
-  hooks:
-    - wget -c https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt
-#    - wget -c http://ftp.apnic.net/stats/apnic/delegated-apnic-latest
-#    - cat delegated-apnic-latest | awk -F '|' '/CN/&&/ipv4/ {print $4 "/" 32-log($5)/log(2)}' > cnip.txt
+version: 2
+project_name: ts-dns
 builds:
-  - env:
+  - main: ./cmd
+    binary: ts-dns
+    env:
       - CGO_ENABLED=0
-    main: ./cmd/
     ldflags:
-      - -X main.VERSION={{.Version}} -s -w
-    goos:
-      - windows
-      - darwin
-      - linux
-      - freebsd
-    goarch:
-      - amd64
-      - 386
-      - arm
-      - arm64
-      - mips
-      - mipsle
-      - mips64
-      - mips64le
-    goarm:
-      - 6
-      - 7
-    gomips:
-      - hardfloat
-      - softfloat
+      - -s -w -X main.VERSION={{.Version}}
+    goos: [linux, darwin, windows, freebsd]
+    goarch: [amd64, arm64, arm, '386', mips, mipsle, mips64, mips64le]
+    goarm: ['6', '7']
+    gomips: [hardfloat, softfloat]
     ignore:
-      - goos: windows
-        goarch: arm
-      - goos: windows
-        goarch: arm64
-      - goos: windows
-        goarch: 386
+      - goos: darwin
+        goarch: '386'
       - goos: darwin
         goarch: arm
-      - goos: darwin
-        goarch: arm64
-      - goos: darwin
-        goarch: 386
-      - goos: freebsd
+      - goos: windows
         goarch: arm
-      - goos: freebsd
-        goarch: arm64
-      - goos: freebsd
-        goarch: 386
-      - goarch: mips64
-        gomips: hardfloat
-      - goarch: mips64
-        gomips: softfloat
-      - goarch: mips64le
-        gomips: hardfloat
-      - goarch: mips64le
-        gomips: softfloat
 archives:
-  - replacements:
-      darwin: Darwin
-      linux: Linux
-      windows: Windows
-      386: i386
-      amd64: x86_64
+  - name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}{{ if .Mips }}_{{ .Mips }}{{ end }}'
+    formats: [tar.gz]
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
     files:
-      - README*.md
+      - README.md
       - LICENSE
       - ts-dns*.toml
-      - gfwlist.txt
-      - cnip.txt
-snapshot:
-  name_template: "{{ .Tag }}"
+checksum:
+  name_template: '{{ .ProjectName }}_{{ .Version }}_checksums.txt'
 changelog:
   sort: asc
   filters:
-    exclude:
-      - '^docs:'
-      - '^test:'
+    exclude: ['^docs:', '^test:']
