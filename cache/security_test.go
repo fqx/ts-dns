@@ -1,8 +1,10 @@
 package cache
 
 import (
+	"fmt"
 	"github.com/miekg/dns"
 	"github.com/wolf-joe/ts-dns/config"
+	"sync"
 	"testing"
 )
 
@@ -54,5 +56,36 @@ func TestCacheQueryIsolationAndResponseSemantics(t *testing.T) {
 			}
 			c.Set(other, r)
 		})
+	}
+}
+
+func TestCacheConcurrentCapacity(t *testing.T) {
+	c, err := NewDNSCache(config.Conf{Cache: config.CacheConf{Size: 4}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			q := new(dns.Msg)
+			q.SetQuestion(fmt.Sprintf("host%d.example.", i), dns.TypeA)
+			r := new(dns.Msg)
+			r.SetReply(q)
+			rr, _ := dns.NewRR(q.Question[0].Name + " 60 IN A 192.0.2.1")
+			r.Answer = []dns.RR{rr}
+			c.Set(q, r)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	impl := c.(*dnsCache)
+	impl.lock.RLock()
+	defer impl.lock.RUnlock()
+	if len(impl.items) > 4 {
+		t.Fatalf("capacity exceeded: %d", len(impl.items))
 	}
 }

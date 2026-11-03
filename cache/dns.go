@@ -129,13 +129,6 @@ func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg) {
 	if c.maxSize <= 0 || !cacheableQuery(req) || resp == nil || len(resp.Answer) == 0 {
 		return
 	}
-	// check size
-	c.lock.RLock()
-	length := len(c.items)
-	c.lock.RUnlock()
-	if length >= c.maxSize {
-		return
-	}
 	// reset ttl
 	key := c.cacheKey(req)
 	var expire = c.maxTTL
@@ -153,7 +146,9 @@ func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg) {
 	// set cache
 	expiredAt := time.Now().Add(expire).Unix()
 	c.lock.Lock()
-	c.items[key] = cacheItem{resp: resp.Copy(), expiredAt: expiredAt}
+	if _, exists := c.items[key]; exists || len(c.items) < c.maxSize {
+		c.items[key] = cacheItem{resp: resp.Copy(), expiredAt: expiredAt}
+	}
 	c.lock.Unlock()
 }
 
