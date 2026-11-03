@@ -63,8 +63,11 @@ host permitted, or by the configured GitHub Actions check. No clean advisory-sca
 result is claimed from that blocked local attempt. The initial GitHub CI run on
 commit `4330265` selected Go 1.27.0 and reported nine reachable standard-library
 advisories. The workflows now select latest 1.27.x and the module requires at
-least 1.27.3; the final pushed commit must pass the online scanner before a clean
-result can be claimed.
+least 1.27.3. GitHub CI run `41588855900` for commit
+`bab49bf1e2f532acf8bb618f6a7db823baaea39e` passed, including the online scanner
+reporting "No vulnerabilities found." That result covers that exact commit only;
+the coordinated local changes described below have not been pushed or scanned
+by GitHub CI.
 
 The updater has a dedicated validated `gfwlist_proxy` setting: explicit HTTP,
 HTTPS, SOCKS5/SOCKS5h or direct, with compatibility-preserving group/environment
@@ -110,3 +113,47 @@ IPSet integration executes a fixed program with argument arrays, not a shell;
 privileged IPSet/ICMP behavior was reviewed but was not exercised against a live
 kernel/network. Cross-compiled artifacts require native smoke testing on their
 target operating systems before production use.
+
+## Coordinated follow-up review (local changes after bab49bf)
+
+A valid NXDOMAIN or NOERROR/NODATA background refresh previously left its stale
+positive available until the end of the grace period. The refresh now captures
+an opaque token retaining the exact cached response. A validated negative result
+invalidates only that response in the same routing generation. A delayed negative
+cannot erase a newer positive, even if that newer positive has also expired.
+Transport failures, SERVFAIL/REFUSED, truncated/mismatched replies, and NS-only
+referrals preserve the existing bounded fallback. Tests cover NXDOMAIN, empty
+NODATA, SOA NODATA, CNAME+SOA NODATA, and concurrent newer positives in the same
+and a new routing generation. Negative answers remain uncached.
+
+Foreground DoH bootstrap requests could enqueue while the caller loop was exiting
+and wait forever on an unclosed job completion channel. A caller-lifetime done
+signal now covers both enqueue and completion waits. Exit is idempotent and
+cancels active resolution/HTTP requests. Regression tests exercise active,
+queued, and blocked foreground bootstrap calls using Background contexts during
+Exit, plus handler Stop and Reload.
+
+SOCKS TCP-connect deadlines alone did not bound negotiation when Transport
+used a detached dialing context. Both explicit SOCKS5/SOCKS5h and inherited group
+SOCKS now bound the whole dial/handshake. Each GFWList fetch owns a transport,
+uses its actual request context for dialing, and closes its owned connections
+on cancellation/deadline. Repeated stalled-negotiation tests verify socket cleanup
+without first calling CloseIdleConnections; a separate test checks that the
+SOCKS dial itself has an independent handshake deadline. Baseline reproductions
+failed before these fixes and pass afterward.
+
+The README is restructured into installation, configuration, operation/security,
+and development guidance, retaining upstream attribution. Tests parse its TOML
+examples, compare the default example to the distributed configuration, and check
+fork release/CI links. It explicitly documents an IPSet limitation: cache hits do
+not synchronously renew external IPSet entries. Immediate stale delivery cannot
+guarantee that routing entries exist before the client's first connection. For
+strict routing consistency disable serve_stale and cover the normal cache TTL;
+otherwise set ipset_ttl above max_ttl + serve_stale with operational margin.
+External set flushing, reload initialization, and capacity limits still prevent
+a strict guarantee. No privileged live-IPSet validation was performed.
+
+Follow-up local validation: full race-enabled package suite, vet, build, module
+integrity, and diff whitespace checks passed. Logs and the local-only review patch
+are supplied separately. Push authorization is paused; no remote branch changes,
+PR, merge, deployment, or release were performed for this follow-up.

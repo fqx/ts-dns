@@ -1,8 +1,10 @@
 package cache
 
 import (
+	"fmt"
 	"github.com/miekg/dns"
 	"github.com/wolf-joe/ts-dns/config"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -124,5 +126,89 @@ func TestStaleConfigurationValidation(t *testing.T) {
 		if _, err := NewDNSCache(config.Conf{Cache: conf}); err == nil {
 			t.Fatal("accepted invalid stale bounds")
 		}
+	}
+}
+
+func TestNegativeRefreshInvalidatesOnlyCapturedEntry(t *testing.T) {
+	for _, kind := range []string{"nxdomain", "nodata", "cname-nodata", "empty-nodata", "servfail", "refused", "transport", "truncated", "wrong-question", "referral"} {
+		t.Run(kind, func(t *testing.T) {
+			c, now, q, positive := staleTestCache(t, 20)
+			c.Set(q, positive, 1)
+			now.Store(110)
+			token, ok := c.CaptureRefresh(q, 1)
+			if !ok {
+				t.Fatal("missing stale snapshot")
+			}
+			negative := new(dns.Msg)
+			negative.SetReply(q)
+			soa, _ := dns.NewRR("example. 30 IN SOA ns.example. hostmaster.example. 1 60 60 60 5")
+			invalidate := true
+			switch kind {
+			case "nxdomain":
+				negative.Rcode = dns.RcodeNameError
+			case "nodata":
+				negative.Ns = []dns.RR{soa}
+			case "cname-nodata":
+				negative.Ns = []dns.RR{soa}
+				cname, _ := dns.NewRR("example.com. 60 IN CNAME missing.example.")
+				negative.Answer = []dns.RR{cname}
+			case "empty-nodata":
+			case "servfail":
+				negative.Rcode = dns.RcodeServerFailure
+				invalidate = false
+			case "refused":
+				negative.Rcode = dns.RcodeRefused
+				invalidate = false
+			case "transport":
+				negative = nil
+				invalidate = false
+			case "truncated":
+				negative.Truncated = true
+				negative.Rcode = dns.RcodeNameError
+				invalidate = false
+			case "wrong-question":
+				negative.Question[0].Name = "other.example."
+				negative.Rcode = dns.RcodeNameError
+				invalidate = false
+			case "referral":
+				ns, _ := dns.NewRR("example. 60 IN NS ns.example.")
+				negative.Ns = []dns.RR{ns}
+				invalidate = false
+			}
+			c.InvalidateNegativeRefresh(token, q, negative)
+			got, _ := c.Lookup(q, 1)
+			if (got == nil) != invalidate {
+				t.Fatalf("invalidated=%t, want %t", got == nil, invalidate)
+			}
+		})
+	}
+}
+func TestDelayedNegativeRefreshCannotEraseNewPositive(t *testing.T) {
+	for _, newRevision := range []uint64{1, 2} {
+		t.Run(fmt.Sprint(newRevision), func(t *testing.T) {
+			c, now, q, positive := staleTestCache(t, 20)
+			c.Set(q, positive, 1)
+			now.Store(110)
+			token, ok := c.CaptureRefresh(q, 1)
+			if !ok {
+				t.Fatal("missing stale snapshot")
+			}
+			negative := new(dns.Msg)
+			negative.SetRcode(q, dns.RcodeNameError)
+			release := make(chan struct{})
+			done := make(chan struct{})
+			go func() { <-release; c.InvalidateNegativeRefresh(token, q, negative); close(done) }()
+			newer := positive.Copy()
+			newer.Answer[0].(*dns.A).A = net.ParseIP("192.0.2.9")
+			c.Set(q, newer, newRevision)
+			// Let the replacement expire too: identity, not merely freshness, protects it.
+			now.Store(120)
+			close(release)
+			<-done
+			got, key := c.Lookup(q, newRevision)
+			if got == nil || key == "" || got.Answer[0].(*dns.A).A.String() != "192.0.2.9" {
+				t.Fatal("delayed negative erased newer positive")
+			}
+		})
 	}
 }

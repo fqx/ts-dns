@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
@@ -45,7 +46,9 @@ func TestReadmeConfigurationAndForkLinks(t *testing.T) {
 		if strings.Contains(block[1], "gfwlist_proxy") {
 			sawProxy = true
 			g := conf.Groups["dirty"]
-			g.GFWListFile = "../" + g.GFWListFile
+			if g.GFWListFile != "" && !filepath.IsAbs(g.GFWListFile) {
+				g.GFWListFile = filepath.Join("..", g.GFWListFile)
+			}
 			conf.Groups["dirty"] = g
 			if _, err := outbound.BuildGroups(conf); err != nil {
 				t.Fatalf("README updater config is invalid: %v", err)

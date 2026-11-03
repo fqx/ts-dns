@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/wolf-joe/ts-dns/cache"
 	"github.com/wolf-joe/ts-dns/utils"
 )
 
@@ -17,6 +18,7 @@ type cacheRefresh struct {
 	key      string
 	req      *dns.Msg
 	revision uint64
+	token    cache.RefreshToken
 }
 
 type staleRefresher struct {
@@ -67,7 +69,8 @@ func (r *staleRefresher) start(h *handlerImpl) {
 				case job := <-r.queue:
 					if r.ctx.Err() == nil && h.routingRevision() == job.revision {
 						// Another refresh may already have made this entry fresh while queued.
-						if _, key := h.cache.Lookup(job.req, job.revision); key == job.key {
+						if token, ok := h.cache.CaptureRefresh(job.req, job.revision); ok {
+							job.token = token
 							ctx, cancel := context.WithTimeout(r.ctx, staleRefreshTimeout)
 							_ = h.handleRequest(ctx, utils.NewFakeRespWriter(), job.req, &job)
 							cancel()

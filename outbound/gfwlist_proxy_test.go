@@ -24,6 +24,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/wolf-joe/ts-dns/config"
+	"golang.org/x/net/proxy"
 )
 
 const proxyTestUser = "proxy-user"
@@ -456,7 +457,6 @@ func TestGFWListProxyCancellationAndTimeout(t *testing.T) {
 				case <-time.After(time.Second):
 					t.Fatal("proxy outlived cancellation/timeout")
 				}
-				g.gfwListClient.CloseIdleConnections()
 				select {
 				case <-closed:
 				case <-time.After(time.Second):
@@ -576,4 +576,129 @@ func TestGFWListProxyBodyTimeoutAndStop(t *testing.T) {
 			t.Fatal("stop left proxy connection open")
 		}
 	})
+}
+
+func stalledSOCKSRepeater(t *testing.T) (string, *atomic.Int32, <-chan struct{}) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var active atomic.Int32
+	closed := make(chan struct{}, 16)
+	acceptDone := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	connections := map[net.Conn]bool{}
+	go func() {
+		defer close(acceptDone)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			connections[conn] = true
+			mu.Unlock()
+			active.Add(1)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer conn.Close()
+				_, _ = io.Copy(io.Discard, conn)
+				active.Add(-1)
+				closed <- struct{}{}
+				mu.Lock()
+				delete(connections, conn)
+				mu.Unlock()
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		listener.Close()
+		<-acceptDone
+		mu.Lock()
+		for conn := range connections {
+			conn.Close()
+		}
+		mu.Unlock()
+		wg.Wait()
+	})
+	return listener.Addr().String(), &active, closed
+}
+func TestGFWListRepeatedSOCKSHandshakeTimeoutCleanup(t *testing.T) {
+	for _, setting := range []string{"socks5", "socks5h", "inherit"} {
+		t.Run(setting, func(t *testing.T) {
+			address, active, closed := stalledSOCKSRepeater(t)
+			conf := config.Group{GFWListURL: "https://rules.example.invalid/list", GFWListTimeout: "80ms"}
+			if setting == "inherit" {
+				conf.Socks5 = address
+			} else {
+				conf.GFWListProxy = setting + "://" + address
+			}
+			g := testGFWListGroup(t, conf)
+			for attempt := 0; attempt < 3; attempt++ {
+				_, err := g.fetchGFWList(context.Background())
+				if err == nil {
+					t.Fatal("stalled SOCKS handshake succeeded")
+				}
+				// Do not call CloseIdleConnections: the fetch's own deadline must reclaim
+				// negotiation work before another retry is allowed to accumulate sockets.
+				select {
+				case <-closed:
+				case <-time.After(400 * time.Millisecond):
+					t.Fatalf("attempt %d left SOCKS negotiation alive after timeout; active=%d", attempt, active.Load())
+				}
+				if active.Load() != 0 {
+					t.Fatal("stalled SOCKS sockets accumulated across retries")
+				}
+			}
+		})
+	}
+}
+func TestGFWListSOCKSDialItselfHasHandshakeDeadline(t *testing.T) {
+	for _, inherited := range []bool{false, true} {
+		t.Run(fmt.Sprint(inherited), func(t *testing.T) {
+			address, _, closed := stalledSOCKSRepeater(t)
+			var fallback proxy.Dialer
+			setting := "socks5://" + address
+			if inherited {
+				setting = ""
+				var err error
+				fallback, err = proxy.SOCKS5("tcp", address, nil, proxy.Direct)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			client, err := newGFWListClient(setting, fallback, 80*time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.CloseIdleConnections()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+			go func() {
+				conn, err := client.Transport.(*http.Transport).DialContext(ctx, "tcp", "rules.example.invalid:443")
+				if conn != nil {
+					conn.Close()
+				}
+				result <- err
+			}()
+			select {
+			case err := <-result:
+				var timeout net.Error
+				if !errors.As(err, &timeout) || !timeout.Timeout() {
+					t.Fatalf("handshake deadline was not preserved: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("SOCKS dial has no independent handshake deadline")
+			}
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("expired SOCKS dial did not close socket")
+			}
+		})
+	}
 }

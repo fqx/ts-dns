@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/miekg/dns"
 	"github.com/wolf-joe/ts-dns/config"
@@ -53,6 +54,18 @@ func newStaleUpstream(t *testing.T) *staleUpstream {
 		r.SetReply(q)
 		if mode == 2 {
 			r.Rcode = dns.RcodeServerFailure
+		} else if mode >= 4 && mode <= 7 {
+			if mode == 4 {
+				r.Rcode = dns.RcodeNameError
+			}
+			if mode != 7 {
+				soa, _ := dns.NewRR("example. 30 IN SOA ns.example. hostmaster.example. 1 60 60 60 5")
+				r.Ns = []dns.RR{soa}
+			}
+			if mode == 6 {
+				cname, _ := dns.NewRR(q.Question[0].Name + " 60 IN CNAME missing.example.")
+				r.Answer = []dns.RR{cname}
+			}
 		} else {
 			ip, ttl := "192.0.2.1", 1
 			if mode != 0 {
@@ -386,5 +399,130 @@ func TestStoppedHandlerCannotBeResurrectedByReload(t *testing.T) {
 	}
 	if r := staleQuery(handler, "after-stop.example."); r == nil || r.Rcode != dns.RcodeServerFailure {
 		t.Fatal("query after stop did not fail safely")
+	}
+}
+
+func TestStaleNegativeRefreshInvalidatesPositive(t *testing.T) {
+	for _, mode := range []int32{4, 5, 6, 7} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			u := newStaleUpstream(t)
+			w, h, _ := staleHandler(t, u, 10)
+			assertAnswer(t, staleQuery(w, "negative.example."), "192.0.2.1")
+			waitForStale(t, h, "negative.example.")
+			u.mode.Store(mode)
+			assertAnswer(t, staleQuery(w, "negative.example."), "192.0.2.1")
+			select {
+			case <-u.started:
+			case <-time.After(time.Second):
+				t.Fatal("negative refresh did not run")
+			}
+			waitRefreshIdle(t, h)
+			q := new(dns.Msg)
+			q.SetQuestion("negative.example.", dns.TypeA)
+			if r, _ := h.cache.Lookup(q, h.routingRevision()); r != nil {
+				t.Fatal("valid negative refresh left the old positive available")
+			}
+			response := staleQuery(w, "negative.example.")
+			if mode == 4 {
+				if response.Rcode != dns.RcodeNameError {
+					t.Fatal("next query did not receive NXDOMAIN")
+				}
+			} else if response.Rcode != dns.RcodeSuccess {
+				t.Fatal("next query did not receive NOERROR/NODATA")
+			}
+			for _, answer := range response.Answer {
+				if _, ok := answer.(*dns.A); ok {
+					t.Fatal("next query received the stale positive")
+				}
+			}
+			if r, _ := h.cache.Lookup(q, h.routingRevision()); r != nil {
+				t.Fatal("negative answer was cached")
+			}
+		})
+	}
+}
+
+type bootstrapLifecycleResolver struct{ started, stopped chan struct{} }
+
+func (*bootstrapLifecycleResolver) ServeDNS(dns.ResponseWriter, *dns.Msg) {
+	panic("expected contextual bootstrap")
+}
+func (r *bootstrapLifecycleResolver) ServeDNSContext(ctx context.Context, _ dns.ResponseWriter, _ *dns.Msg) {
+	close(r.started)
+	<-ctx.Done()
+	close(r.stopped)
+}
+
+type bootstrapLifecycleGroup struct {
+	caller   *outbound.DoHCallerV2
+	resolver *bootstrapLifecycleResolver
+}
+
+func (*bootstrapLifecycleGroup) Match(*dns.Msg) bool            { return false }
+func (*bootstrapLifecycleGroup) IsFallback() bool               { return true }
+func (*bootstrapLifecycleGroup) Name() string                   { return "bootstrap" }
+func (*bootstrapLifecycleGroup) String() string                 { return "bootstrap" }
+func (*bootstrapLifecycleGroup) PostProcess(*dns.Msg, *dns.Msg) {}
+func (g *bootstrapLifecycleGroup) Start(dns.Handler)            { g.caller.Start(g.resolver) }
+func (g *bootstrapLifecycleGroup) Stop()                        { g.caller.Exit() }
+func (g *bootstrapLifecycleGroup) Handle(q *dns.Msg) *dns.Msg   { r, _ := g.caller.Call(q); return r }
+func (g *bootstrapLifecycleGroup) HandleContext(ctx context.Context, q *dns.Msg) *dns.Msg {
+	r, _ := g.caller.CallContext(ctx, q)
+	return r
+}
+
+func TestForegroundDoHBootstrapStopsAcrossReload(t *testing.T) {
+	for _, reload := range []bool{false, true} {
+		t.Run(fmt.Sprint(reload), func(t *testing.T) {
+			conf := config.Conf{Groups: map[string]config.Group{"fallback": {}}}
+			h, err := newHandle(conf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			caller, err := outbound.NewDoHCallerV2("https://resolver.example.invalid/dns-query", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolver := &bootstrapLifecycleResolver{started: make(chan struct{}), stopped: make(chan struct{})}
+			group := &bootstrapLifecycleGroup{caller: caller, resolver: resolver}
+			h.groups = map[string]outbound.IGroup{"bootstrap": group}
+			h.fallbackGroup = group
+			h.start()
+			wrapper := &handlerWrapper{handlerPtr: unsafe.Pointer(h)}
+			defer wrapper.Stop()
+			result := make(chan struct{}, 3)
+			call := func() { _ = staleQuery(wrapper, "bootstrap.example."); result <- struct{}{} }
+			go call()
+			select {
+			case <-resolver.started:
+			case <-time.After(time.Second):
+				t.Fatal("foreground bootstrap did not start")
+			}
+			go call()
+			go call()
+			if reload {
+				conf.Hosts = map[string]string{"bootstrap.example": "192.0.2.3"}
+				if err := wrapper.ReloadConfig(conf); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				wrapper.Stop()
+			}
+			for i := 0; i < 3; i++ {
+				select {
+				case <-result:
+				case <-time.After(time.Second):
+					t.Fatal("foreground query hung during reload/stop")
+				}
+			}
+			select {
+			case <-resolver.stopped:
+			case <-time.After(time.Second):
+				t.Fatal("old bootstrap resolver survived lifecycle change")
+			}
+			if reload {
+				assertAnswer(t, staleQuery(wrapper, "bootstrap.example."), "192.0.2.3")
+			}
+		})
 	}
 }

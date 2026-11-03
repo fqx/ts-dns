@@ -321,6 +321,9 @@ func (h *handlerImpl) handleRequest(ctx context.Context, writer dns.ResponseWrit
 	if ctx.Err() != nil {
 		return nil
 	}
+	if refresh != nil {
+		h.cache.InvalidateNegativeRefresh(refresh.token, req, resp)
+	}
 	h.cache.Set(req, resp, revision)
 	return resp
 }

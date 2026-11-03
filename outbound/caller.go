@@ -157,10 +157,16 @@ type DoHCallerV2 struct {
 	requireCh       chan *dohClientRequest
 	resolverContext context.Context
 	cancelResolver  context.CancelFunc
-	cancelCh        chan interface{} // stop run()
+	done            chan struct{}
+	exitOnce        sync.Once
 }
 
 func (caller *DoHCallerV2) Start(resolver dns.Handler) {
+	select {
+	case <-caller.done:
+		return
+	default:
+	}
 	caller.resolver = resolver
 	caller.resolverContext, caller.cancelResolver = context.WithCancel(context.Background())
 	go caller.run(time.Hour*24, time.Second)
@@ -174,6 +180,12 @@ func (caller *DoHCallerV2) run(resolveCycle time.Duration, timeout time.Duration
 		case <-tick.C:
 			caller.resolve(nil, timeout, caller.resolverContext)
 		case job := <-caller.requireCh:
+			select {
+			case <-caller.done:
+				tick.Stop()
+				return
+			default:
+			}
 			caller.rwMux.RLock()
 			empty := len(caller.clients) == 0
 			caller.rwMux.RUnlock()
@@ -181,7 +193,7 @@ func (caller *DoHCallerV2) run(resolveCycle time.Duration, timeout time.Duration
 				caller.resolve(job.req, timeout, job.ctx)
 			}
 			close(job.done)
-		case <-caller.cancelCh:
+		case <-caller.done:
 			tick.Stop()
 			return
 		}
@@ -196,6 +208,13 @@ func (caller *DoHCallerV2) resolve(srcReq *dns.Msg, timeout time.Duration, paren
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
+	if caller.resolverContext != nil {
+		stop := context.AfterFunc(caller.resolverContext, cancel)
+		defer stop()
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	genClient := func(ip string) *http.Client {
 		return &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (conn net.Conn, err error) {
@@ -274,6 +293,11 @@ type dohClientRequest struct {
 }
 
 func (caller *DoHCallerV2) getClientContext(ctx context.Context, req *dns.Msg) *http.Client {
+	select {
+	case <-caller.done:
+		return nil
+	default:
+	}
 	choose := func() *http.Client {
 		caller.rwMux.RLock()
 		defer caller.rwMux.RUnlock()
@@ -288,12 +312,16 @@ func (caller *DoHCallerV2) getClientContext(ctx context.Context, req *dns.Msg) *
 	job := &dohClientRequest{req: req, ctx: ctx, done: make(chan struct{})}
 	select {
 	case caller.requireCh <- job:
+	case <-caller.done:
+		return nil
 	case <-ctx.Done():
 		return nil
 	}
 	select {
 	case <-job.done:
 		return choose()
+	case <-caller.done:
+		return nil
 	case <-ctx.Done():
 		return nil
 	}
@@ -304,9 +332,20 @@ func (caller *DoHCallerV2) Call(request *dns.Msg) (*dns.Msg, error) {
 	return caller.CallContext(context.Background(), request)
 }
 func (caller *DoHCallerV2) CallContext(ctx context.Context, request *dns.Msg) (r *dns.Msg, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if caller.resolverContext != nil {
+		stop := context.AfterFunc(caller.resolverContext, cancel)
+		defer stop()
+	}
 	client := caller.getClientContext(ctx, request)
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
+	}
+	select {
+	case <-caller.done:
+		return nil, errors.New("DoH caller stopped")
+	default:
 	}
 	if client == nil {
 		return nil, errors.New("empty client for doh caller")
@@ -354,17 +393,17 @@ func (caller *DoHCallerV2) CallContext(ctx context.Context, request *dns.Msg) (r
 
 // Exit 停止后台goroutine。caller退出时行为
 func (caller *DoHCallerV2) Exit() {
-	logrus.Debugf("stop caller %s", caller)
-	if caller.cancelResolver != nil {
-		caller.cancelResolver()
-	}
-	caller.rwMux.RLock()
-	for _, client := range caller.clients {
-		client.CloseIdleConnections()
-	}
-	caller.rwMux.RUnlock()
-	caller.cancelCh <- struct{}{}
-	logrus.Debugf("stop caller %s success", caller)
+	caller.exitOnce.Do(func() {
+		close(caller.done)
+		if caller.cancelResolver != nil {
+			caller.cancelResolver()
+		}
+		caller.rwMux.RLock()
+		for _, client := range caller.clients {
+			client.CloseIdleConnections()
+		}
+		caller.rwMux.RUnlock()
+	})
 }
 
 // String 描述caller
@@ -402,7 +441,7 @@ func NewDoHCallerV2(rawURL string, dialer proxy.Dialer) (*DoHCallerV2, error) {
 	caller := &DoHCallerV2{host: host, port: port, url: u.String(),
 		rwMux: sync.RWMutex{}, dialer: dialer}
 	caller.requireCh = make(chan *dohClientRequest, 1)
-	caller.cancelCh = make(chan interface{}, 1)
+	caller.done = make(chan struct{})
 	return caller, nil
 }
 

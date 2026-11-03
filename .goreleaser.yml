@@ -1,5 +1,7 @@
 version: 2
 project_name: ts-dns
+release:
+  prerelease: auto
 builds:
   - main: ./cmd
     binary: ts-dns

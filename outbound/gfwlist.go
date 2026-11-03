@@ -34,12 +34,17 @@ func (g *groupImpl) fetchGFWList(ctx context.Context) (*matcher.ABPlus, error) {
 		}
 		defer client.CloseIdleConnections()
 	}
+	ctx, client, cleanup := scopedGFWListClient(ctx, client)
+	defer cleanup()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.gfwListURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		return nil, &gfwListNetworkError{operation: "fetch gfwlist", cause: err}
 	}
 	defer resp.Body.Close()
@@ -48,6 +53,9 @@ func (g *groupImpl) fetchGFWList(ctx context.Context) (*matcher.ABPlus, error) {
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxGFWListSize+1))
 	if err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		return nil, &gfwListNetworkError{operation: "read gfwlist", cause: err}
 	}
 	if len(raw) > maxGFWListSize {

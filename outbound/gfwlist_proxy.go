@@ -95,7 +95,13 @@ func newGFWListClient(setting string, inherited proxy.Dialer, timeout time.Durat
 		if !ok {
 			return nil, errors.New("gfwlist proxy must support context cancellation")
 		}
-		transport.DialContext = d.DialContext
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			// http.Transport may detach this context from the request. A connect-only
+			// net.Dialer timeout is insufficient once SOCKS negotiation has started.
+			bounded, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			return d.DialContext(bounded, network, address)
+		}
 	}
 	client := &http.Client{Timeout: timeout, Transport: transport}
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
@@ -128,3 +134,38 @@ func (e *gfwListNetworkError) Error() string {
 	return fmt.Sprintf("%s: network or proxy failure", e.operation)
 }
 func (e *gfwListNetworkError) Unwrap() error { return e.cause }
+
+// Each fetch owns its transport and sockets. Bind dialing and established proxy
+// negotiation to the real request lifetime, rather than Transport's detached
+// dial context, so retries cannot retain stalled handshakes from previous fetches.
+func scopedGFWListClient(parent context.Context, template *http.Client) (context.Context, *http.Client, func()) {
+	timeout := template.Timeout
+	if timeout <= 0 {
+		timeout = defaultGFWListTimeout
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	transport := template.Transport.(*http.Transport).Clone()
+	dial := transport.DialContext
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	transport.DialContext = func(_ context.Context, network, address string) (net.Conn, error) {
+		conn, err := dial(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		scoped := &gfwListConn{Conn: conn}
+		scoped.stop = context.AfterFunc(ctx, func() { _ = conn.Close() })
+		return scoped, nil
+	}
+	client := *template
+	client.Transport = transport
+	return ctx, &client, func() { cancel(); transport.CloseIdleConnections() }
+}
+
+type gfwListConn struct {
+	net.Conn
+	stop func() bool
+}
+
+func (c *gfwListConn) Close() error { c.stop(); return c.Conn.Close() }

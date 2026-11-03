@@ -127,3 +127,61 @@ func TestIPSetBackgroundCancellation(t *testing.T) {
 		t.Fatal("helper survived refresh cancellation")
 	}
 }
+
+func TestDoHExitUnblocksActiveAndQueuedBootstrap(t *testing.T) {
+	resolver := &cancelingResolver{started: make(chan struct{}), stopped: make(chan struct{})}
+	caller, err := NewDoHCallerV2("https://resolver.example.invalid/dns-query", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller.Start(resolver)
+	defer caller.Exit()
+	result := make(chan error, 3)
+	call := func() {
+		q := new(dns.Msg)
+		q.SetQuestion("example.com.", dns.TypeA)
+		_, err := caller.CallContext(context.Background(), q)
+		result <- err
+	}
+	go call()
+	select {
+	case <-resolver.started:
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap did not start")
+	}
+	go call()
+	deadline := time.Now().Add(time.Second)
+	for len(caller.requireCh) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("second bootstrap did not queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	go call()
+	caller.Exit()
+	for i := 0; i < 3; i++ {
+		select {
+		case err := <-result:
+			if err == nil {
+				t.Fatal("stopped bootstrap succeeded")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("foreground bootstrap blocked after exit")
+		}
+	}
+	select {
+	case <-resolver.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("active bootstrap did not cancel")
+	}
+	// A new foreground request must also refuse an already stopped caller.
+	call()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("stopped caller accepted request")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request enqueued after stop and hung")
+	}
+}

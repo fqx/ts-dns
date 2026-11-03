@@ -23,7 +23,7 @@ stale_ttl = 5  # 过期响应 TTL（1-30 秒），不超过剩余宽限期
   rules_file = "rules.txt"  # 规则文件，每行一个规则
   fallback = true # 设置为兜底域名组
 
-  ecs = "1.2.4.0/24"  # edns-client-subnet信息，配置后转发DNS请求时默认附带（已有ecs时不覆盖），暂不支持doh
+  ecs = "1.2.4.0/24"  # edns-client-subnet信息，配置后转发DNS请求时默认附带（已有ecs时不覆盖）
   no_cookie = false  # 禁用edns cookie，默认false，dnspod(119.29.29.29)等特殊服务器需要设置为true
   dns = ["223.5.5.5:53", "114.114.114.114/tcp"]  # DNS服务器列表，默认使用53端口
   concurrent = true  # 并发请求dns服务器列表

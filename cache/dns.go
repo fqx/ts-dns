@@ -22,6 +22,8 @@ type IDNSCache interface {
 	Get(req *dns.Msg, revision ...uint64) *dns.Msg
 	// Lookup returns a refresh key only for an eligible stale response.
 	Lookup(req *dns.Msg, revision ...uint64) (*dns.Msg, string)
+	CaptureRefresh(req *dns.Msg, revision ...uint64) (RefreshToken, bool)
+	InvalidateNegativeRefresh(token RefreshToken, req, resp *dns.Msg)
 	// Set save response to cache
 	Set(req *dns.Msg, resp *dns.Msg, revision ...uint64)
 	// Start life cycle begin
@@ -314,4 +316,60 @@ func negativeSOAAnswer(req, resp *dns.Msg) bool {
 		}
 	}
 	return false
+}
+
+// RefreshToken retains the exact immutable cache response, preventing pointer
+// reuse and ensuring a delayed negative result cannot erase a newer insertion.
+type RefreshToken struct {
+	key      string
+	revision uint64
+	response *dns.Msg
+}
+
+func (c *dnsCache) CaptureRefresh(req *dns.Msg, revision ...uint64) (RefreshToken, bool) {
+	if c.maxSize <= 0 || c.staleWindow <= 0 || !cacheableQuery(req) {
+		return RefreshToken{}, false
+	}
+	generation := routingRevision(revision)
+	key := c.cacheKey(req, generation)
+	now := c.now().Unix()
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	item, ok := c.items[key]
+	if !ok || c.revision != generation || item.expiredAt > now || item.expiredAt+c.staleWindow <= now {
+		return RefreshToken{}, false
+	}
+	return RefreshToken{key: key, revision: generation, response: item.resp}, true
+}
+
+func (c *dnsCache) InvalidateNegativeRefresh(token RefreshToken, req, resp *dns.Msg) {
+	if token.response == nil || !validNegativeRefresh(req, resp) || c.cacheKey(req, token.revision) != token.key {
+		return
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.revision != token.revision {
+		return
+	}
+	if current, ok := c.items[token.key]; ok && current.resp == token.response {
+		delete(c.items, token.key)
+	}
+}
+func validNegativeRefresh(req, resp *dns.Msg) bool {
+	if !cacheableQuery(req) || resp == nil || !resp.Response || resp.Truncated || resp.Id != req.Id || resp.Opcode != req.Opcode || len(resp.Question) != 1 {
+		return false
+	}
+	q, r := req.Question[0], resp.Question[0]
+	if !strings.EqualFold(q.Name, r.Name) || q.Qtype != r.Qtype || q.Qclass != r.Qclass {
+		return false
+	}
+	if resp.Rcode == dns.RcodeNameError {
+		return true
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		return false
+	}
+	// SOA identifies NODATA, including CNAME+NODATA. Empty NOERROR without
+	// authority records is also NODATA; NS-only referrals are not definitive.
+	return negativeSOAAnswer(req, resp) || (len(resp.Answer) == 0 && len(resp.Ns) == 0)
 }
