@@ -173,3 +173,55 @@ func TestCacheDoesNotStoreCNAMENXDOMAIN(t *testing.T) {
 		t.Fatal("NXDOMAIN cached using CNAME TTL instead of SOA negative TTL")
 	}
 }
+
+func TestCacheReclaimsObsoleteGenerations(t *testing.T) {
+	c, err := NewDNSCache(config.Conf{Cache: config.CacheConf{Size: 2, MinTTL: 86400, MaxTTL: 86400}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := func(name string) *dns.Msg { m := new(dns.Msg); m.SetQuestion(name+".example.", dns.TypeA); return m }
+	r := func(req *dns.Msg) *dns.Msg {
+		m := new(dns.Msg)
+		m.SetReply(req)
+		a, _ := dns.NewRR(req.Question[0].Name + " 86400 IN A 192.0.2.1")
+		m.Answer = []dns.RR{a}
+		return m
+	}
+	first, second := q("first"), q("second")
+	c.Set(first, r(first), 1)
+	c.Set(second, r(second), 1)
+	if c.Get(first, 1) == nil || c.Get(second, 1) == nil {
+		t.Fatal("failed to fill long-TTL cache")
+	}
+	// A miss on a newer revision must reclaim the obsolete full generation.
+	if c.Get(first, 2) != nil {
+		t.Fatal("returned an obsolete answer")
+	}
+	c.Set(first, r(first), 2)
+	c.Set(second, r(second), 2)
+	if c.Get(first, 2) == nil || c.Get(second, 2) == nil {
+		t.Fatal("new revision could not fill reclaimed capacity")
+	}
+	// Late old responses cannot roll back the generation or consume its capacity.
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); old := q("late-old"); c.Set(old, r(old), 1); _ = c.Get(old, 1) }()
+	}
+	wg.Wait()
+	if c.Get(first, 2) == nil || c.Get(second, 2) == nil {
+		t.Fatal("old request evicted active generation")
+	}
+	// A direct insertion also reclaims capacity without requiring an initial Get.
+	third := q("third")
+	c.Set(third, r(third), 3)
+	if c.Get(third, 3) == nil {
+		t.Fatal("Set failed to reclaim the previous generation")
+	}
+	impl := c.(*dnsCache)
+	impl.lock.RLock()
+	defer impl.lock.RUnlock()
+	if len(impl.items) != 1 {
+		t.Fatalf("obsolete entries retained: %d", len(impl.items))
+	}
+}

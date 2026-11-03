@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-func TestGFWListRefreshChangesCachedRoute(t *testing.T) {
+func TestGFWListRefreshReclaimsFullLongTTLCache(t *testing.T) {
 	upstream := func(ip string) (string, *atomic.Int32) {
 		t.Helper()
 		var calls atomic.Int32
@@ -29,7 +29,7 @@ func TestGFWListRefreshChangesCachedRoute(t *testing.T) {
 			calls.Add(1)
 			r := new(dns.Msg)
 			r.SetReply(q)
-			a, _ := dns.NewRR(q.Question[0].Name + " 3600 IN A " + ip)
+			a, _ := dns.NewRR(q.Question[0].Name + " 86400 IN A " + ip)
 			r.Answer = []dns.RR{a}
 			_ = w.WriteMsg(r)
 		})}
@@ -39,12 +39,17 @@ func TestGFWListRefreshChangesCachedRoute(t *testing.T) {
 		return conn.LocalAddr().String(), &calls
 	}
 	clean, cleanCalls := upstream("192.0.2.1")
-	dirty, _ := upstream("192.0.2.2")
+	dirty, dirtyCalls := upstream("192.0.2.2")
 	update := make(chan struct{})
 	var fetches atomic.Int32
 	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rule := "||seed.example\n"
-		if fetches.Add(1) > 1 {
+		attempt := fetches.Add(1)
+		if attempt > 2 {
+			<-r.Context().Done()
+			return
+		}
+		if attempt == 2 {
 			select {
 			case <-update:
 				rule = "||changed.example\n"
@@ -59,7 +64,7 @@ func TestGFWListRefreshChangesCachedRoute(t *testing.T) {
 	if err := os.WriteFile(seed, []byte(base64.StdEncoding.EncodeToString([]byte("||seed.example\n"))), 0600); err != nil {
 		t.Fatal(err)
 	}
-	h, err := newHandle(config.Conf{Cache: config.CacheConf{Size: 16}, Groups: map[string]config.Group{
+	h, err := newHandle(config.Conf{Cache: config.CacheConf{Size: 1, MinTTL: 86400, MaxTTL: 86400}, Groups: map[string]config.Group{
 		"clean": {DNS: []string{clean}}, "dirty": {DNS: []string{dirty}, GFWListFile: seed, GFWListURL: source.URL, GFWListUpdateInterval: "10ms"},
 	}})
 	if err != nil {
@@ -98,4 +103,8 @@ func TestGFWListRefreshChangesCachedRoute(t *testing.T) {
 	close(update)
 	waitRevision(before)
 	query("192.0.2.2")
+	query("192.0.2.2")
+	if dirtyCalls.Load() != 1 {
+		t.Fatal("full old generation prevented new-route caching")
+	}
 }

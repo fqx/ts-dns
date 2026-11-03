@@ -66,18 +66,16 @@ type dnsCache struct {
 	stopCh  chan struct{}
 	stopped chan struct{}
 
-	maxSize int
-	minTTL  time.Duration
-	maxTTL  time.Duration
+	revision uint64 // protected by lock; monotonically advances for this cache lifetime
+	maxSize  int
+	minTTL   time.Duration
+	maxTTL   time.Duration
 }
 
 func (c *dnsCache) cacheKey(req *dns.Msg, revision ...uint64) string {
 	question := req.Question[0]
 	key := fmt.Sprintf("%s|%d|%d|%t|%t|%t|%t", question.Name, question.Qtype, question.Qclass, req.CheckingDisabled, req.IsEdns0() != nil && req.IsEdns0().Do(), req.AuthenticatedData, req.RecursionDesired)
-	var generation uint64
-	if len(revision) > 0 {
-		generation = revision[0]
-	}
+	generation := routingRevision(revision)
 	var udpSize uint16
 	opt := req.IsEdns0()
 	if opt != nil {
@@ -96,9 +94,23 @@ func (c *dnsCache) Get(req *dns.Msg, revision ...uint64) *dns.Msg {
 	}
 	// check cache
 	key := c.cacheKey(req, revision...)
+	requested := routingRevision(revision)
 	c.lock.RLock()
 	item, exists := c.items[key]
+	current := c.revision
 	c.lock.RUnlock()
+	if requested != current {
+		if requested < current {
+			return nil
+		}
+		c.lock.Lock()
+		if !c.advanceRevisionLocked(requested) {
+			c.lock.Unlock()
+			return nil
+		}
+		item, exists = c.items[key]
+		c.lock.Unlock()
+	}
 	if !exists {
 		return nil
 	}
@@ -107,7 +119,9 @@ func (c *dnsCache) Get(req *dns.Msg, revision ...uint64) *dns.Msg {
 	if ttl <= 0 {
 		// remove expired item
 		c.lock.Lock()
-		delete(c.items, key)
+		if latest, ok := c.items[key]; ok && latest.expiredAt <= time.Now().Unix() {
+			delete(c.items, key)
+		}
 		c.lock.Unlock()
 		return nil
 	}
@@ -156,6 +170,10 @@ func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg, revision ...uint64) {
 	// set cache
 	expiredAt := time.Now().Add(expire).Unix()
 	c.lock.Lock()
+	if !c.advanceRevisionLocked(routingRevision(revision)) {
+		c.lock.Unlock()
+		return
+	}
 	if _, exists := c.items[key]; exists || len(c.items) < c.maxSize {
 		c.items[key] = cacheItem{resp: resp.Copy(), expiredAt: expiredAt}
 	}
@@ -213,6 +231,26 @@ func cacheableQuery(req *dns.Msg) bool {
 				return false
 			}
 		}
+	}
+	return true
+}
+
+func routingRevision(revision []uint64) uint64 {
+	if len(revision) == 0 {
+		return 0
+	}
+	return revision[0]
+}
+
+// advanceRevisionLocked reclaims obsolete entries without allowing late requests
+// to roll back the generation. The caller must hold the write lock.
+func (c *dnsCache) advanceRevisionLocked(revision uint64) bool {
+	if revision < c.revision {
+		return false
+	}
+	if revision > c.revision {
+		c.items = make(map[string]cacheItem)
+		c.revision = revision
 	}
 	return true
 }
