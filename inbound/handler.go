@@ -219,7 +219,14 @@ func (h *handlerImpl) handle(writer dns.ResponseWriter, req *dns.Msg) (resp *dns
 		_info.hitHosts = true
 		return resp
 	}
-	if resp = h.cache.Get(req); resp != nil {
+	// Capture once: an in-flight old route can only populate its old namespace.
+	var revision uint64
+	for _, group := range h.groups {
+		if versioned, ok := group.(interface{ CacheRevision() uint64 }); ok {
+			revision += versioned.CacheRevision()
+		}
+	}
+	if resp = h.cache.Get(req, revision); resp != nil {
 		_info.hitCache = true
 		return resp
 	}
@@ -251,7 +258,7 @@ func (h *handlerImpl) handle(writer dns.ResponseWriter, req *dns.Msg) (resp *dns
 
 	// finally
 	matched.PostProcess(req, resp)
-	h.cache.Set(req, resp)
+	h.cache.Set(req, resp, revision)
 	return resp
 }
 

@@ -28,6 +28,8 @@ archives:
       - README.md
       - LICENSE
       - ts-dns*.toml
+      - gfwlist.txt
+      - gfwlist-source.json
 checksum:
   name_template: '{{ .ProjectName }}_{{ .Version }}_checksums.txt'
 changelog:

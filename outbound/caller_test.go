@@ -44,7 +44,7 @@ func TestDNSCaller(t *testing.T) {
 	// 不使用代理，mock掉Exchange
 	p := MockMethodSeq(caller.client, "Exchange", []gomonkey.Params{
 		{nil, time.Second, fmt.Errorf("err")},
-		{&dns.Msg{}, time.Second, nil},
+		{&dns.Msg{MsgHdr: dns.MsgHdr{Response: true}}, time.Second, nil},
 	})
 	// exchange调用失败
 	r, err := caller.Call(req)

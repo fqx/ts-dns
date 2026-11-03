@@ -195,12 +195,14 @@ type groupImpl struct {
 	name     string
 	fallback bool
 
-	disableQTypes   map[uint16]bool
-	matcher         *matcher.ABPlus
-	gfwList         unsafe.Pointer // type: *matcher.ABPlus
-	gfwListURL      string
-	gfwListInterval time.Duration
-	cancelRefresh   context.CancelFunc
+	disableQTypes        map[uint16]bool
+	matcher              *matcher.ABPlus
+	gfwList              unsafe.Pointer // type: *matcher.ABPlus
+	gfwListURL           string
+	gfwListInterval      time.Duration
+	gfwListRevision      atomic.Uint64
+	gfwListRetryInterval time.Duration
+	cancelRefresh        context.CancelFunc
 
 	noCookie bool              // 是否删除请求中的cookie
 	withECS  *dns.EDNS0_SUBNET // 是否在请求中附加ECS信息
@@ -417,25 +419,39 @@ func (g *groupImpl) Start(resolver dns.Handler) {
 		if interval <= 0 {
 			interval = time.Hour
 		}
-		refresh := func() {
-			m, err := g.fetchGFWList(ctx)
-			if err != nil {
-				if ctx.Err() == nil {
-					logrus.Warnf("refresh gfw list for %s failed: %v", g.name, err)
-				}
-				return
-			}
-			atomic.StorePointer(&g.gfwList, unsafe.Pointer(m))
+		retryBase := g.gfwListRetryInterval
+		if retryBase <= 0 {
+			retryBase = time.Minute
 		}
-		refresh()
-		tick := time.NewTicker(interval)
-		defer tick.Stop()
+		retryDelay := retryBase
+		timer := time.NewTimer(0)
+		defer timer.Stop()
 		for {
 			select {
-			case <-tick.C:
-				refresh()
 			case <-ctx.Done():
 				return
+			case <-timer.C:
+				m, err := g.fetchGFWList(ctx)
+				if ctx.Err() != nil {
+					return
+				}
+				next := interval
+				if err != nil {
+					logrus.Warnf("refresh gfw list for %s failed: %v", g.name, err)
+					next = retryDelay
+					if next > interval {
+						next = interval
+					}
+					retryDelay *= 2
+					if retryDelay > 15*time.Minute {
+						retryDelay = 15 * time.Minute
+					}
+				} else {
+					atomic.StorePointer(&g.gfwList, unsafe.Pointer(m))
+					g.gfwListRevision.Add(1)
+					retryDelay = retryBase
+				}
+				timer.Reset(next)
 			}
 		}
 	}()
@@ -450,3 +466,6 @@ func (g *groupImpl) Stop() {
 	<-g.stopped
 	logrus.Debugf("stop group %s success", g)
 }
+
+// CacheRevision changes after publishing a refreshed routing table.
+func (g *groupImpl) CacheRevision() uint64 { return g.gfwListRevision.Load() }

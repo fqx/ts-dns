@@ -218,3 +218,35 @@ func TestGFWListIntervalValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestGFWListRetriesBeforeLongInterval(t *testing.T) {
+	var attempts atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, base64.StdEncoding.EncodeToString([]byte("||recovered.example\n")))
+	}))
+	defer s.Close()
+	groups, err := BuildGroups(config.Conf{Groups: map[string]config.Group{"g": {GFWListURL: s.URL, GFWListUpdateInterval: "24h"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := groups["g"].(*groupImpl)
+	g.gfwListRetryInterval = 10 * time.Millisecond
+	g.Start(nil)
+	defer g.Stop()
+	q := new(dns.Msg)
+	q.SetQuestion("recovered.example.", dns.TypeA)
+	deadline := time.Now().Add(time.Second)
+	for !g.Match(q) {
+		if time.Now().After(deadline) {
+			t.Fatal("failed to retry transient startup failure")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if attempts.Load() < 2 {
+		t.Fatal("recovery did not retry")
+	}
+}

@@ -19,9 +19,9 @@ const (
 // IDNSCache cache dns response for dns request
 type IDNSCache interface {
 	// Get find cached response
-	Get(req *dns.Msg) *dns.Msg
+	Get(req *dns.Msg, revision ...uint64) *dns.Msg
 	// Set save response to cache
-	Set(req *dns.Msg, resp *dns.Msg)
+	Set(req *dns.Msg, resp *dns.Msg, revision ...uint64)
 	// Start life cycle begin
 	Start(cleanTick ...time.Duration)
 	// Stop life cycle end
@@ -71,21 +71,31 @@ type dnsCache struct {
 	maxTTL  time.Duration
 }
 
-func (c *dnsCache) cacheKey(req *dns.Msg) string {
+func (c *dnsCache) cacheKey(req *dns.Msg, revision ...uint64) string {
 	question := req.Question[0]
 	key := fmt.Sprintf("%s|%d|%d|%t|%t|%t|%t", question.Name, question.Qtype, question.Qclass, req.CheckingDisabled, req.IsEdns0() != nil && req.IsEdns0().Do(), req.AuthenticatedData, req.RecursionDesired)
+	var generation uint64
+	if len(revision) > 0 {
+		generation = revision[0]
+	}
+	var udpSize uint16
+	opt := req.IsEdns0()
+	if opt != nil {
+		udpSize = opt.UDPSize()
+	}
+	key += fmt.Sprintf("|routing:%d|edns:%t|udp:%d", generation, opt != nil, udpSize)
 	if subnet := utils.FormatECS(req); subnet != "" {
 		key += "." + subnet
 	}
 	return strings.ToLower(key)
 }
 
-func (c *dnsCache) Get(req *dns.Msg) *dns.Msg {
+func (c *dnsCache) Get(req *dns.Msg, revision ...uint64) *dns.Msg {
 	if c.maxSize <= 0 || !cacheableQuery(req) {
 		return nil
 	}
 	// check cache
-	key := c.cacheKey(req)
+	key := c.cacheKey(req, revision...)
 	c.lock.RLock()
 	item, exists := c.items[key]
 	c.lock.RUnlock()
@@ -125,12 +135,12 @@ func (c *dnsCache) Get(req *dns.Msg) *dns.Msg {
 	return r
 }
 
-func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg) {
-	if c.maxSize <= 0 || !cacheableQuery(req) || resp == nil || len(resp.Answer) == 0 {
+func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg, revision ...uint64) {
+	if c.maxSize <= 0 || !cacheableQuery(req) || resp == nil || resp.Truncated || resp.Rcode != dns.RcodeSuccess || len(resp.Answer) == 0 {
 		return
 	}
 	// reset ttl
-	key := c.cacheKey(req)
+	key := c.cacheKey(req, revision...)
 	var expire = c.maxTTL
 	for _, answer := range resp.Answer {
 		if ttl := time.Duration(answer.Header().Ttl) * time.Second; ttl < expire {
@@ -191,11 +201,13 @@ func cacheableQuery(req *dns.Msg) bool {
 	if req == nil || len(req.Question) != 1 || req.Opcode != dns.OpcodeQuery {
 		return false
 	}
+	seenOPT := false
 	for _, rr := range req.Extra {
 		opt, ok := rr.(*dns.OPT)
-		if !ok || opt.Version() != 0 {
+		if !ok || opt.Version() != 0 || seenOPT {
 			return false
 		}
+		seenOPT = true
 		for _, option := range opt.Option {
 			if _, ok := option.(*dns.EDNS0_SUBNET); !ok {
 				return false

@@ -47,6 +47,12 @@ func (caller *DNSCaller) Start(_ dns.Handler) {}
 func (caller *DNSCaller) Call(request *dns.Msg) (r *dns.Msg, err error) {
 	if caller.proxy == nil { // 不使用代理，直接发送dns请求
 		r, _, err = caller.client.Exchange(request, caller.server)
+		if err != nil {
+			return nil, err
+		}
+		if err = validateDNSResponse(request, r); err != nil {
+			return nil, err
+		}
 		return
 	}
 	timeout := caller.client.Timeout
