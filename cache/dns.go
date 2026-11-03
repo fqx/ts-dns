@@ -20,6 +20,8 @@ const (
 type IDNSCache interface {
 	// Get find cached response
 	Get(req *dns.Msg, revision ...uint64) *dns.Msg
+	// Lookup returns a refresh key only for an eligible stale response.
+	Lookup(req *dns.Msg, revision ...uint64) (*dns.Msg, string)
 	// Set save response to cache
 	Set(req *dns.Msg, resp *dns.Msg, revision ...uint64)
 	// Start life cycle begin
@@ -29,6 +31,16 @@ type IDNSCache interface {
 }
 
 func NewDNSCache(conf config.Conf) (IDNSCache, error) {
+	if conf.Cache.ServeStale < 0 || conf.Cache.ServeStale > 86400 {
+		return nil, fmt.Errorf("cache.serve_stale must be between 0 and 86400 seconds")
+	}
+	if conf.Cache.StaleTTL < 0 || conf.Cache.StaleTTL > 30 {
+		return nil, fmt.Errorf("cache.stale_ttl must be between 1 and 30 seconds, or 0 for the default")
+	}
+	staleTTL := conf.Cache.StaleTTL
+	if staleTTL == 0 {
+		staleTTL = 5
+	}
 	minTTL, maxTTL := DefaultMinTTL, DefaultMaxTTL
 	if conf.Cache.MinTTL > 0 {
 		minTTL = time.Second * time.Duration(conf.Cache.MinTTL)
@@ -40,13 +52,16 @@ func NewDNSCache(conf config.Conf) (IDNSCache, error) {
 		return nil, fmt.Errorf("min ttl(%d) larger than max ttl(%d)", conf.Cache.MinTTL, conf.Cache.MaxTTL)
 	}
 	c := &dnsCache{
-		items:   map[string]cacheItem{},
-		lock:    new(sync.RWMutex),
-		stopCh:  make(chan struct{}),
-		stopped: make(chan struct{}),
-		maxSize: conf.Cache.Size,
-		minTTL:  minTTL,
-		maxTTL:  maxTTL,
+		items:       map[string]cacheItem{},
+		lock:        new(sync.RWMutex),
+		stopCh:      make(chan struct{}),
+		stopped:     make(chan struct{}),
+		maxSize:     conf.Cache.Size,
+		minTTL:      minTTL,
+		maxTTL:      maxTTL,
+		staleWindow: int64(conf.Cache.ServeStale),
+		staleTTL:    int64(staleTTL),
+		now:         time.Now,
 	}
 	return c, nil
 }
@@ -66,10 +81,13 @@ type dnsCache struct {
 	stopCh  chan struct{}
 	stopped chan struct{}
 
-	revision uint64 // protected by lock; monotonically advances for this cache lifetime
-	maxSize  int
-	minTTL   time.Duration
-	maxTTL   time.Duration
+	revision    uint64 // protected by lock; monotonically advances for this cache lifetime
+	maxSize     int
+	minTTL      time.Duration
+	maxTTL      time.Duration
+	staleWindow int64
+	staleTTL    int64
+	now         func() time.Time
 }
 
 func (c *dnsCache) cacheKey(req *dns.Msg, revision ...uint64) string {
@@ -89,8 +107,13 @@ func (c *dnsCache) cacheKey(req *dns.Msg, revision ...uint64) string {
 }
 
 func (c *dnsCache) Get(req *dns.Msg, revision ...uint64) *dns.Msg {
+	r, _ := c.Lookup(req, revision...)
+	return r
+}
+
+func (c *dnsCache) Lookup(req *dns.Msg, revision ...uint64) (*dns.Msg, string) {
 	if c.maxSize <= 0 || !cacheableQuery(req) {
-		return nil
+		return nil, ""
 	}
 	// check cache
 	key := c.cacheKey(req, revision...)
@@ -101,29 +124,36 @@ func (c *dnsCache) Get(req *dns.Msg, revision ...uint64) *dns.Msg {
 	c.lock.RUnlock()
 	if requested != current {
 		if requested < current {
-			return nil
+			return nil, ""
 		}
 		c.lock.Lock()
 		if !c.advanceRevisionLocked(requested) {
 			c.lock.Unlock()
-			return nil
+			return nil, ""
 		}
 		item, exists = c.items[key]
 		c.lock.Unlock()
 	}
 	if !exists {
-		return nil
+		return nil, ""
 	}
-	// ttl countdown
-	ttl := item.expiredAt - time.Now().Unix()
+	// Never advance expiredAt when returning stale data. Only a successful Set
+	// can establish a new lifetime; failure and repeat hits keep the original bound.
+	now := c.now().Unix()
+	ttl := item.expiredAt - now
+	refreshKey := ""
 	if ttl <= 0 {
-		// remove expired item
-		c.lock.Lock()
-		if latest, ok := c.items[key]; ok && latest.expiredAt <= time.Now().Unix() {
-			delete(c.items, key)
+		remaining := item.expiredAt + c.staleWindow - now
+		if c.staleWindow <= 0 || remaining <= 0 {
+			c.lock.Lock()
+			if latest, ok := c.items[key]; ok && latest.expiredAt+c.staleWindow <= now {
+				delete(c.items, key)
+			}
+			c.lock.Unlock()
+			return nil, ""
 		}
-		c.lock.Unlock()
-		return nil
+		refreshKey = key
+		ttl = min(c.staleTTL, remaining)
 	}
 	r := item.resp.Copy()
 	r.Id = req.Id
@@ -132,6 +162,16 @@ func (c *dnsCache) Get(req *dns.Msg, revision ...uint64) *dns.Msg {
 	r.CheckingDisabled = req.CheckingDisabled
 	for i := 0; i < len(r.Answer); i++ {
 		r.Answer[i].Header().Ttl = uint32(ttl)
+	}
+	if refreshKey != "" {
+		r.AuthenticatedData = false
+		for _, section := range [][]dns.RR{r.Ns, r.Extra} {
+			for _, rr := range section {
+				if rr.Header().Rrtype != dns.TypeOPT {
+					rr.Header().Ttl = uint32(ttl)
+				}
+			}
+		}
 	}
 	// shuffle ip
 	first := uint32(len(r.Answer))
@@ -146,11 +186,11 @@ func (c *dnsCache) Get(req *dns.Msg, revision ...uint64) *dns.Msg {
 			ips[i], ips[j] = ips[j], ips[i]
 		}
 	}
-	return r
+	return r, refreshKey
 }
 
 func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg, revision ...uint64) {
-	if c.maxSize <= 0 || !cacheableQuery(req) || resp == nil || resp.Truncated || resp.Rcode != dns.RcodeSuccess || len(resp.Answer) == 0 {
+	if c.maxSize <= 0 || !cacheableQuery(req) || resp == nil || resp.Truncated || resp.Rcode != dns.RcodeSuccess || len(resp.Answer) == 0 || negativeSOAAnswer(req, resp) {
 		return
 	}
 	// reset ttl
@@ -168,7 +208,7 @@ func (c *dnsCache) Set(req *dns.Msg, resp *dns.Msg, revision ...uint64) {
 		resp.Answer[i].Header().Ttl = uint32(expire.Seconds())
 	}
 	// set cache
-	expiredAt := time.Now().Add(expire).Unix()
+	expiredAt := c.now().Add(expire).Unix()
 	c.lock.Lock()
 	if !c.advanceRevisionLocked(routingRevision(revision)) {
 		c.lock.Unlock()
@@ -192,14 +232,7 @@ func (c *dnsCache) Start(_cleanTick ...time.Duration) {
 		for {
 			select {
 			case <-tk.C:
-				// clean expired key
-				c.lock.Lock()
-				for key, item := range c.items {
-					if time.Now().Unix() >= item.expiredAt {
-						delete(c.items, key)
-					}
-				}
-				c.lock.Unlock()
+				c.cleanExpired()
 			case <-c.stopCh:
 				tk.Stop()
 				close(c.stopped)
@@ -253,4 +286,32 @@ func (c *dnsCache) advanceRevisionLocked(revision uint64) bool {
 		c.revision = revision
 	}
 	return true
+}
+
+// Keep stale entries only while the configured grace period can still serve them.
+func (c *dnsCache) cleanExpired() {
+	now := c.now().Unix()
+	c.lock.Lock()
+	for key, item := range c.items {
+		if now >= item.expiredAt+c.staleWindow {
+			delete(c.items, key)
+		}
+	}
+	c.lock.Unlock()
+}
+
+// A CNAME can appear before a NOERROR/NODATA SOA response. Its long positive
+// TTL must not turn that negative result into an eligible stale cache entry.
+func negativeSOAAnswer(req, resp *dns.Msg) bool {
+	for _, rr := range resp.Ns {
+		if rr.Header().Rrtype == dns.TypeSOA {
+			for _, answer := range resp.Answer {
+				if req.Question[0].Qtype == dns.TypeANY || answer.Header().Rrtype == req.Question[0].Qtype {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
 }

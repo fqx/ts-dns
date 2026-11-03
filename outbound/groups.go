@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -130,6 +132,19 @@ func BuildGroups(globalConf config.Conf) (map[string]IGroup, error) {
 			logrus.Debugf("set proxy(%s) for group %s", conf.Socks5, name)
 			g.proxy = dialer
 		}
+		timeout := defaultGFWListTimeout
+		if conf.GFWListTimeout != "" {
+			parsed, err := time.ParseDuration(conf.GFWListTimeout)
+			if err != nil || parsed <= 0 {
+				return nil, errors.New("invalid gfwlist_timeout: use a positive Go duration")
+			}
+			timeout = parsed
+		}
+		var clientErr error
+		g.gfwListClient, clientErr = newGFWListClient(conf.GFWListProxy, g.proxy, timeout)
+		if clientErr != nil {
+			return nil, fmt.Errorf("configure gfwlist downloader for group %s: %w", name, clientErr)
+		}
 		// caller
 		var callers []Caller
 		for _, addr := range conf.DNS {
@@ -200,6 +215,7 @@ type groupImpl struct {
 	gfwList              unsafe.Pointer // type: *matcher.ABPlus
 	gfwListURL           string
 	gfwListInterval      time.Duration
+	gfwListClient        *http.Client
 	gfwListRevision      atomic.Uint64
 	gfwListRetryInterval time.Duration
 	cancelRefresh        context.CancelFunc
@@ -244,7 +260,22 @@ func (g *groupImpl) Match(req *dns.Msg) bool {
 	return false
 }
 
-func (g *groupImpl) Handle(req *dns.Msg) *dns.Msg {
+func (g *groupImpl) Handle(req *dns.Msg) *dns.Msg { return g.HandleContext(context.Background(), req) }
+func (g *groupImpl) HandleContext(ctx context.Context, req *dns.Msg) *dns.Msg {
+	ctx, cancel := context.WithCancel(ctx)
+	var pending sync.WaitGroup
+	defer func() { cancel(); pending.Wait() }()
+	if ctx.Err() != nil {
+		return nil
+	}
+	call := func(caller Caller) (*dns.Msg, error) {
+		if contextual, ok := caller.(interface {
+			CallContext(context.Context, *dns.Msg) (*dns.Msg, error)
+		}); ok {
+			return contextual.CallContext(ctx, req)
+		}
+		return caller.Call(req)
+	}
 	for _, question := range req.Question {
 		if g.disableQTypes[question.Qtype] {
 			return nil // disabled
@@ -264,7 +295,10 @@ func (g *groupImpl) Handle(req *dns.Msg) *dns.Msg {
 	if !g.concurrent && !g.fastestIP {
 		// 依次请求上游DNS
 		for _, caller := range g.callers {
-			resp, err := caller.Call(req)
+			if ctx.Err() != nil {
+				return nil
+			}
+			resp, err := call(caller)
 			if err != nil {
 				logrus.Warnf("group %s call %s failed: %+v", g.name, caller, err)
 				continue
@@ -278,8 +312,10 @@ func (g *groupImpl) Handle(req *dns.Msg) *dns.Msg {
 	chLen := len(g.callers)
 	respCh := make(chan *dns.Msg, chLen)
 	for _, caller := range g.callers {
+		pending.Add(1)
 		go func(caller Caller) {
-			resp, err := caller.Call(req)
+			defer pending.Done()
+			resp, err := call(caller)
 			if err == nil {
 				respCh <- resp
 			} else {
@@ -295,18 +331,27 @@ func (g *groupImpl) Handle(req *dns.Msg) *dns.Msg {
 	}
 	if (qType == dns.TypeA || qType == dns.TypeAAAA) && g.fastestIP {
 		// 测速并返回最快ip
-		return g.fastestResp(qType, respCh, chLen)
+		return g.fastestResp(qType, respCh, chLen, ctx)
 	}
 	// 无需测速，只需返回第一个不为nil的DNS响应
 	for i := 0; i < chLen; i++ {
-		if resp := <-respCh; resp != nil {
-			return resp
+		select {
+		case resp := <-respCh:
+			if resp != nil {
+				return resp
+			}
+		case <-ctx.Done():
+			return nil
 		}
 	}
 	return nil
 }
 
-func (g *groupImpl) fastestResp(qType uint16, respCh chan *dns.Msg, chLen int) *dns.Msg {
+func (g *groupImpl) fastestResp(qType uint16, respCh chan *dns.Msg, chLen int, contexts ...context.Context) *dns.Msg {
+	ctx := context.Background()
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
 	const (
 		maxGoNum    = 15 // 最大并发量
 		pingTimeout = 500 * time.Millisecond
@@ -316,7 +361,12 @@ func (g *groupImpl) fastestResp(qType uint16, respCh chan *dns.Msg, chLen int) *
 	respMap := make(map[string]*dns.Msg, maxGoNum)
 	var firstResp *dns.Msg // 最早抵达的msg，当测速失败时返回该响应
 	for i := 0; i < chLen; i++ {
-		resp := <-respCh
+		var resp *dns.Msg
+		select {
+		case resp = <-respCh:
+		case <-ctx.Done():
+			return nil
+		}
 		if resp == nil {
 			continue
 		}
@@ -336,8 +386,8 @@ func (g *groupImpl) fastestResp(qType uint16, respCh chan *dns.Msg, chLen int) *
 				}
 			}
 			if ip != "" {
-				allIP = append(allIP, ip)
 				if _, exists := respMap[ip]; !exists {
+					allIP = append(allIP, ip)
 					respMap[ip] = resp
 					if len(respMap) >= maxGoNum {
 						goto doPing
@@ -347,6 +397,9 @@ func (g *groupImpl) fastestResp(qType uint16, respCh chan *dns.Msg, chLen int) *
 		}
 	}
 doPing:
+	if ctx.Err() != nil {
+		return nil
+	}
 	switch len(respMap) {
 	case 0: // 没有任何IP地址
 		return firstResp
@@ -355,7 +408,7 @@ doPing:
 			return resp
 		}
 	}
-	fastestIP, cost, err := utils.FastestPingIP(allIP, g.tcpPingPort, pingTimeout)
+	fastestIP, cost, err := utils.FastestPingIPContext(ctx, allIP, g.tcpPingPort, pingTimeout)
 	if err != nil {
 		return firstResp
 	}
@@ -381,7 +434,10 @@ doPing:
 	return msg
 }
 
-func (g *groupImpl) PostProcess(_ *dns.Msg, resp *dns.Msg) {
+func (g *groupImpl) PostProcess(req, resp *dns.Msg) {
+	g.PostProcessContext(context.Background(), req, resp)
+}
+func (g *groupImpl) PostProcessContext(ctx context.Context, _ *dns.Msg, resp *dns.Msg) {
 	if resp == nil {
 		return
 	}
@@ -397,7 +453,18 @@ func (g *groupImpl) PostProcess(_ *dns.Msg, resp *dns.Msg) {
 		if val == "" || target == nil {
 			continue
 		}
-		if err := target.Add(val, target.GetTimeout()); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		var err error
+		if contextual, ok := target.(interface {
+			AddContext(context.Context, string, int) error
+		}); ok {
+			err = contextual.AddContext(ctx, val, target.GetTimeout())
+		} else {
+			err = target.Add(val, target.GetTimeout())
+		}
+		if err != nil {
 			logrus.Warnf("add %s to ipset<%s> failed: %+v", val, target.GetName(), err)
 		}
 	}
@@ -464,6 +531,9 @@ func (g *groupImpl) Stop() {
 		caller.Exit()
 	}
 	<-g.stopped
+	if g.gfwListClient != nil {
+		g.gfwListClient.CloseIdleConnections()
+	}
 	logrus.Debugf("stop group %s success", g)
 }
 

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/BurntSushi/toml"
@@ -34,13 +34,11 @@ func main() {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 	// 读取配置文件
-	conf := config.Conf{}
-	if _, err := toml.DecodeFile(*filename, &conf); err != nil {
+	conf, err := readConfig(*filename)
+	if err != nil {
 		logrus.Fatalf("load config file %q failed: %+v", *filename, err)
 	}
-	buf := bytes.NewBuffer(nil)
-	_ = toml.NewEncoder(buf).Encode(conf)
-	logrus.Debugf("load config success: %s", buf)
+	logrus.Debug("load config success")
 	// 解析监听地址
 	if *listen == "" {
 		listen = &conf.Listen
@@ -85,20 +83,36 @@ func main() {
 }
 
 func reloadConf(ch chan os.Signal, filename *string, handler inbound.IHandler) {
-	for {
-		<-ch
-		conf := config.Conf{}
-		if _, err := toml.DecodeFile(*filename, &conf); err != nil {
+	for range ch {
+		conf, err := readConfig(*filename)
+		if err != nil {
 			logrus.Warnf("load config file %q failed: %+v", *filename, err)
 			continue
 		}
-		buf := bytes.NewBuffer(nil)
-		_ = toml.NewEncoder(buf).Encode(conf)
-		logrus.Debugf("reload config: %s", buf)
+		logrus.Debug("reload config")
 		if err := handler.ReloadConfig(conf); err != nil {
 			logrus.Warnf("reload config failed: %+v", err)
 			continue
 		}
 		logrus.Infof("reload config success")
 	}
+}
+
+// Decoder messages may contain configuration values, including proxy passwords.
+// Report only safe locations or filesystem causes, never raw decoder input.
+func readConfig(filename string) (config.Conf, error) {
+	var conf config.Conf
+	_, err := toml.DecodeFile(filename, &conf)
+	if err == nil {
+		return conf, nil
+	}
+	var parseError toml.ParseError
+	if errors.As(err, &parseError) {
+		return config.Conf{}, fmt.Errorf("invalid TOML at line %d", parseError.Position.Line)
+	}
+	var pathError *os.PathError
+	if errors.As(err, &pathError) {
+		return config.Conf{}, fmt.Errorf("read configuration: %w", pathError.Err)
+	}
+	return config.Conf{}, errors.New("configuration value has an invalid type")
 }

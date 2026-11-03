@@ -14,6 +14,8 @@ hosts_files = ["/etc/hosts"]  # hosts文件路径，支持多hosts
 size = 4096  # 缓存大小，为非正数时禁用缓存
 min_ttl = 60  # 最小ttl，单位为秒
 max_ttl = 86400  # 最大ttl，单位为秒
+serve_stale = 0  # 默认关闭；设为 300 可在过期后最多 300 秒先返回旧记录并后台刷新
+stale_ttl = 5  # 过期响应 TTL（1-30 秒），不超过剩余宽限期
 
 [groups] # 对域名进行分组
   [groups.clean]
@@ -36,6 +38,11 @@ max_ttl = 86400  # 最大ttl，单位为秒
 
   gfwlist_url = "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt"
   gfwlist_update_interval = "24h"
+  gfwlist_proxy = "" # 省略/空值：沿用组内 socks5，否则使用 HTTP(S)_PROXY/NO_PROXY
+  gfwlist_timeout = "10s" # 整次下载的超时（包括连接、握手、重定向和读取）
+  # gfwlist_proxy = "socks5h://127.0.0.1:1080" # 独立下载代理，不改变 DNS 转发
+  # gfwlist_proxy = "http://127.0.0.1:7890"
+  # gfwlist_proxy = "direct" # 忽略组内代理和环境变量，明确直连
   gfwlist_file = "gfwlist.txt" # 匹配到gfwlist规则时使用该组
 
   socks5 = "127.0.0.1:1080"  # 当使用国外53端口dns解析时推荐用socks5代理解析

@@ -66,6 +66,30 @@ advisories. The workflows now select latest 1.27.x and the module requires at
 least 1.27.3; the final pushed commit must pass the online scanner before a clean
 result can be claimed.
 
+The updater has a dedicated validated `gfwlist_proxy` setting: explicit HTTP,
+HTTPS, SOCKS5/SOCKS5h or direct, with compatibility-preserving group/environment
+inheritance when unset. Explicit proxies do not fall back to direct. Proxy
+credentials are omitted from config logs and sanitized network/validation
+errors; typed causes remain available to cancellation/timeout checks. A positive
+`gfwlist_timeout` bounds the whole fetch. Local proxy tests cover Basic/SOCKS5
+auth, HTTP CONNECT, TLS proxy and origin verification, overrides/inheritance,
+invalid configuration, stalled handshakes/body reads, stop/cancel, failure
+retention and recovery. Config parsing and startup/reload logs have credential
+confidentiality regression tests.
+
+Stale-while-revalidate is opt-in (`cache.serve_stale`, default 0, maximum 86400
+seconds). The original expiration plus that fixed window bounds all stale
+serving; hits/failures do not reset it. Stale TTL defaults to 5 seconds, is capped
+at 30 and the remaining window, applies to all ordinary sections, and clears AD.
+Existing response eligibility, query profile and routing generation isolation
+remain enforced. Four fixed workers and a 64-job queue deduplicate complete keys;
+refreshes carry a five-second parent context through DNS, DoT, DoH bootstrap and
+HTTP calls and IPSet subprocesses. Stop/reload cancels and joins old workers.
+Queued work is rechecked against the current generation and entry freshness.
+Tests cover deterministic boundaries/TTL, failed refresh and recovery, concurrent
+deduplication, worker/queue limits, routing changes and late results, shutdown,
+reload, contextual DoH bootstrap/requests and cancellation of helper processes.
+
 GFWList updates replace memory only. Default configs load the bundled, checksum-
 recorded local seed synchronously before serving queries; failed remote fetches
 keep that seed active. After restart, the bundled seed is loaded again. Custom

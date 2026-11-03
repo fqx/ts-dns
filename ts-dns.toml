@@ -3,6 +3,11 @@
 
 listen = "127.0.0.1:53"
 
+[cache]
+size = 0 # 默认禁用缓存；启用可设为 4096
+serve_stale = 0 # 过期宽限期（秒），0 关闭；可设为 300
+stale_ttl = 5 # 过期响应的短 TTL（秒）
+
 [groups]
   [groups.clean]
   dns = ["223.5.5.5", "114.114.114.114"]
@@ -12,4 +17,6 @@ listen = "127.0.0.1:53"
   dns = ["208.67.222.222:5353", "176.103.130.130:5353"]
   gfwlist_url = "https://raw.githubusercontent.com/gfwlist/gfwlist/master/gfwlist.txt"
   gfwlist_update_interval = "24h"
+  gfwlist_proxy = "" # 省略/空值：沿用组内 socks5，否则使用 HTTP(S)_PROXY/NO_PROXY
+  gfwlist_timeout = "10s" # 整次下载的超时（包括连接、握手、重定向和读取）
   gfwlist_file = "gfwlist.txt"

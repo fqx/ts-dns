@@ -5,13 +5,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"github.com/wolf-joe/ts-dns/matcher"
-	"golang.org/x/net/proxy"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 const maxGFWListSize = 8 << 20
@@ -28,26 +25,14 @@ func (g *groupImpl) fetchGFWList(ctx context.Context) (*matcher.ABPlus, error) {
 	if err := validateGFWListURL(g.gfwListURL); err != nil {
 		return nil, err
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	defer transport.CloseIdleConnections()
-	if g.proxy != nil {
-		transport.Proxy = nil
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if d, ok := g.proxy.(proxy.ContextDialer); ok {
-				return d.DialContext(ctx, network, addr)
-			}
-			return nil, fmt.Errorf("gfwlist proxy must support context cancellation")
+	client := g.gfwListClient
+	if client == nil {
+		var err error
+		client, err = newGFWListClient("", g.proxy, defaultGFWListTimeout)
+		if err != nil {
+			return nil, err
 		}
-	}
-	client := &http.Client{Timeout: 10 * time.Second, Transport: transport}
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return fmt.Errorf("too many redirects")
-		}
-		if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
-			return fmt.Errorf("insecure redirect")
-		}
-		return validateGFWListURL(req.URL.String())
+		defer client.CloseIdleConnections()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.gfwListURL, nil)
 	if err != nil {
@@ -55,7 +40,7 @@ func (g *groupImpl) fetchGFWList(ctx context.Context) (*matcher.ABPlus, error) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &gfwListNetworkError{operation: "fetch gfwlist", cause: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -63,7 +48,7 @@ func (g *groupImpl) fetchGFWList(ctx context.Context) (*matcher.ABPlus, error) {
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxGFWListSize+1))
 	if err != nil {
-		return nil, err
+		return nil, &gfwListNetworkError{operation: "read gfwlist", cause: err}
 	}
 	if len(raw) > maxGFWListSize {
 		return nil, fmt.Errorf("gfwlist exceeds size limit")

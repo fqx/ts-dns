@@ -55,11 +55,42 @@ func (caller *DNSCaller) Call(request *dns.Msg) (r *dns.Msg, err error) {
 		}
 		return
 	}
+	return caller.callProxy(context.Background(), request)
+}
+
+// CallContext owns a cancellable connection, including established reads/TLS.
+func (caller *DNSCaller) CallContext(ctx context.Context, request *dns.Msg) (*dns.Msg, error) {
+	if caller.proxy != nil {
+		return caller.callProxy(ctx, request)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, err := caller.client.DialContext(ctx, caller.server)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	resp, _, err := caller.client.ExchangeWithConnContext(ctx, request, conn)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDNSResponse(request, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (caller *DNSCaller) callProxy(parent context.Context, request *dns.Msg) (*dns.Msg, error) {
 	timeout := caller.client.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	d, ok := caller.proxy.(proxy.ContextDialer)
 	if !ok {
@@ -70,6 +101,8 @@ func (caller *DNSCaller) Call(request *dns.Msg) (r *dns.Msg, err error) {
 		return nil, err
 	}
 	defer proxyConn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = proxyConn.Close() })
+	defer stop()
 	deadline, _ := ctx.Deadline()
 	if err := proxyConn.SetDeadline(deadline); err != nil {
 		return nil, err
@@ -121,13 +154,15 @@ type DoHCallerV2 struct {
 	resolver dns.Handler
 	dialer   proxy.Dialer
 
-	satisfyCh chan interface{} // 域名解析完成
-	requireCh chan *dns.Msg    // 要求解析域名
-	cancelCh  chan interface{} // stop run()
+	requireCh       chan *dohClientRequest
+	resolverContext context.Context
+	cancelResolver  context.CancelFunc
+	cancelCh        chan interface{} // stop run()
 }
 
 func (caller *DoHCallerV2) Start(resolver dns.Handler) {
 	caller.resolver = resolver
+	caller.resolverContext, caller.cancelResolver = context.WithCancel(context.Background())
 	go caller.run(time.Hour*24, time.Second)
 }
 
@@ -137,16 +172,15 @@ func (caller *DoHCallerV2) run(resolveCycle time.Duration, timeout time.Duration
 	for {
 		select {
 		case <-tick.C:
-			caller.rwMux.Lock()
-			caller.resolve(nil, timeout)
-			caller.rwMux.Unlock()
-		case req := <-caller.requireCh: // getClient()触发
-			caller.rwMux.Lock()
-			if len(caller.clients) == 0 {
-				caller.resolve(req, timeout)
+			caller.resolve(nil, timeout, caller.resolverContext)
+		case job := <-caller.requireCh:
+			caller.rwMux.RLock()
+			empty := len(caller.clients) == 0
+			caller.rwMux.RUnlock()
+			if empty {
+				caller.resolve(job.req, timeout, job.ctx)
 			}
-			caller.rwMux.Unlock()
-			caller.satisfyCh <- struct{}{} // 通知getClient()
+			close(job.done)
 		case <-caller.cancelCh:
 			tick.Stop()
 			return
@@ -155,7 +189,13 @@ func (caller *DoHCallerV2) run(resolveCycle time.Duration, timeout time.Duration
 }
 
 // 使用resolver，将host解析成ipv4并生成clients
-func (caller *DoHCallerV2) resolve(srcReq *dns.Msg, timeout time.Duration) {
+func (caller *DoHCallerV2) resolve(srcReq *dns.Msg, timeout time.Duration, parents ...context.Context) {
+	parent := context.Background()
+	if len(parents) > 0 && parents[0] != nil {
+		parent = parents[0]
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
 	genClient := func(ip string) *http.Client {
 		return &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }, Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (conn net.Conn, err error) {
@@ -179,16 +219,26 @@ func (caller *DoHCallerV2) resolve(srcReq *dns.Msg, timeout time.Duration) {
 	}
 	writer := utils.NewFakeRespWriter()
 	done := make(chan interface{}, 1)
+	contextual, contextAware := caller.resolver.(interface {
+		ServeDNSContext(context.Context, dns.ResponseWriter, *dns.Msg)
+	})
 	go func() {
 		if caller.resolver != nil {
-			caller.resolver.ServeDNS(writer, resolveReq)
+			if contextAware {
+				contextual.ServeDNSContext(ctx, writer, resolveReq)
+			} else {
+				caller.resolver.ServeDNS(writer, resolveReq)
+			}
 		}
 		done <- struct{}{}
 	}()
 	select {
 	case <-done:
-	case <-time.After(timeout):
-		return // 超时直接结束
+	case <-ctx.Done():
+		if contextAware {
+			<-done
+		}
+		return // canceled or timed out
 	}
 	// 解析响应中的ipv4地址
 	clients := make([]*http.Client, 0, 2)
@@ -203,7 +253,13 @@ func (caller *DoHCallerV2) resolve(srcReq *dns.Msg, timeout time.Duration) {
 		}
 	}
 	if len(clients) > 0 {
+		caller.rwMux.Lock()
+		old := caller.clients
 		caller.clients = clients
+		caller.rwMux.Unlock()
+		for _, client := range old {
+			client.CloseIdleConnections()
+		}
 		logrus.Debugf("%s resolve ip %s", caller, ips)
 	} else {
 		logrus.Warnf("%s resolve ip failed", caller)
@@ -211,27 +267,47 @@ func (caller *DoHCallerV2) resolve(srcReq *dns.Msg, timeout time.Duration) {
 }
 
 // 获取一个用于发送DoH查询请求的http客户端
-func (caller *DoHCallerV2) getClient(req *dns.Msg) *http.Client {
-	caller.rwMux.RLock()
-	defer caller.rwMux.RUnlock()
-	var n int
-	if n = len(caller.clients); n == 0 { // 域名未解析
-		caller.rwMux.RUnlock()
-		caller.requireCh <- req // 要求解析域名
-		<-caller.satisfyCh      // 等待解析完成
+type dohClientRequest struct {
+	req  *dns.Msg
+	ctx  context.Context
+	done chan struct{}
+}
+
+func (caller *DoHCallerV2) getClientContext(ctx context.Context, req *dns.Msg) *http.Client {
+	choose := func() *http.Client {
 		caller.rwMux.RLock()
-		if n = len(caller.clients); n == 0 {
+		defer caller.rwMux.RUnlock()
+		if len(caller.clients) == 0 {
 			return nil
 		}
-		goto CHOICE
+		return caller.clients[fastrand.Uint32n(uint32(len(caller.clients)))]
 	}
-CHOICE:
-	return caller.clients[fastrand.Uint32n(uint32(n))]
+	if client := choose(); client != nil {
+		return client
+	}
+	job := &dohClientRequest{req: req, ctx: ctx, done: make(chan struct{})}
+	select {
+	case caller.requireCh <- job:
+	case <-ctx.Done():
+		return nil
+	}
+	select {
+	case <-job.done:
+		return choose()
+	case <-ctx.Done():
+		return nil
+	}
 }
 
 // Call 向上游DNS转发请求
-func (caller *DoHCallerV2) Call(request *dns.Msg) (r *dns.Msg, err error) {
-	client := caller.getClient(request)
+func (caller *DoHCallerV2) Call(request *dns.Msg) (*dns.Msg, error) {
+	return caller.CallContext(context.Background(), request)
+}
+func (caller *DoHCallerV2) CallContext(ctx context.Context, request *dns.Msg) (r *dns.Msg, err error) {
+	client := caller.getClientContext(ctx, request)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if client == nil {
 		return nil, errors.New("empty client for doh caller")
 	}
@@ -246,6 +322,7 @@ func (caller *DoHCallerV2) Call(request *dns.Msg) (r *dns.Msg, err error) {
 	if req, err = http.NewRequest("POST", caller.url, payload); err != nil {
 		return nil, err
 	}
+	req = req.WithContext(ctx)
 	req.Header.Set("Content-Type", contentType)
 	// 发送http请求
 	var resp *http.Response
@@ -278,6 +355,14 @@ func (caller *DoHCallerV2) Call(request *dns.Msg) (r *dns.Msg, err error) {
 // Exit 停止后台goroutine。caller退出时行为
 func (caller *DoHCallerV2) Exit() {
 	logrus.Debugf("stop caller %s", caller)
+	if caller.cancelResolver != nil {
+		caller.cancelResolver()
+	}
+	caller.rwMux.RLock()
+	for _, client := range caller.clients {
+		client.CloseIdleConnections()
+	}
+	caller.rwMux.RUnlock()
 	caller.cancelCh <- struct{}{}
 	logrus.Debugf("stop caller %s success", caller)
 }
@@ -316,8 +401,7 @@ func NewDoHCallerV2(rawURL string, dialer proxy.Dialer) (*DoHCallerV2, error) {
 	}
 	caller := &DoHCallerV2{host: host, port: port, url: u.String(),
 		rwMux: sync.RWMutex{}, dialer: dialer}
-	caller.requireCh = make(chan *dns.Msg, 1)
-	caller.satisfyCh = make(chan interface{}, 1)
+	caller.requireCh = make(chan *dohClientRequest, 1)
 	caller.cancelCh = make(chan interface{}, 1)
 	return caller, nil
 }

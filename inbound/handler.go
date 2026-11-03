@@ -1,10 +1,12 @@
 package inbound
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -46,42 +48,52 @@ var (
 // todo: add unittest
 type handlerWrapper struct {
 	handlerPtr unsafe.Pointer // type: *handlerImpl
+	lifecycle  sync.Mutex
+	stopped    bool
 }
 
 func (w *handlerWrapper) ReloadConfig(conf config.Conf) error {
+	w.lifecycle.Lock()
+	defer w.lifecycle.Unlock()
+	if w.stopped {
+		return errors.New("handler is stopped")
+	}
 	// create & start new handler
 	h, err := newHandle(conf)
 	if err != nil {
 		return fmt.Errorf("make new handler failed: %w", err)
 	}
 	h.start()
-	// swap handler
-	for {
-		old := atomic.LoadPointer(&w.handlerPtr)
-		if atomic.CompareAndSwapPointer(&w.handlerPtr, old, unsafe.Pointer(h)) {
-			if old != nil {
-				(*handlerImpl)(old).stop()
-			}
-			break
-		}
+	// Serialize lifecycle changes so concurrent reloads cannot accumulate workers
+	// or resurrect a handler after Stop has returned.
+	old := atomic.SwapPointer(&w.handlerPtr, unsafe.Pointer(h))
+	if old != nil {
+		(*handlerImpl)(old).stop()
 	}
 	return nil
 }
 
 func (w *handlerWrapper) ServeDNS(writer dns.ResponseWriter, req *dns.Msg) {
-	(*handlerImpl)(atomic.LoadPointer(&w.handlerPtr)).ServeDNS(writer, req)
+	ptr := atomic.LoadPointer(&w.handlerPtr)
+	if ptr == nil {
+		resp := new(dns.Msg)
+		resp.SetRcode(req, dns.RcodeServerFailure)
+		_ = writer.WriteMsg(resp)
+		_ = writer.Close()
+		return
+	}
+	(*handlerImpl)(ptr).ServeDNS(writer, req)
 }
 
 func (w *handlerWrapper) Stop() {
-	for {
-		old := atomic.LoadPointer(&w.handlerPtr)
-		if old == nil {
-			return
-		}
-		if atomic.CompareAndSwapPointer(&w.handlerPtr, old, nil) {
-			(*handlerImpl)(old).stop()
-			return
-		}
+	w.lifecycle.Lock()
+	defer w.lifecycle.Unlock()
+	if w.stopped {
+		return
+	}
+	w.stopped = true
+	if old := atomic.SwapPointer(&w.handlerPtr, nil); old != nil {
+		(*handlerImpl)(old).stop()
 	}
 }
 
@@ -133,6 +145,9 @@ func newHandle(conf config.Conf) (*handlerImpl, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build redirector failed: %w", err)
 	}
+	if conf.Cache.ServeStale > 0 && conf.Cache.Size > 0 {
+		h.refresh = newStaleRefresher()
+	}
 	return h, nil
 }
 
@@ -144,6 +159,7 @@ type handlerImpl struct {
 	groups        map[string]outbound.IGroup
 	fallbackGroup outbound.IGroup
 	redirector    redirector.Redirector
+	refresh       *staleRefresher
 }
 
 func (h *handlerImpl) ServeDNS(writer dns.ResponseWriter, req *dns.Msg) {
@@ -158,7 +174,35 @@ func (h *handlerImpl) ServeDNS(writer dns.ResponseWriter, req *dns.Msg) {
 	_ = writer.Close()
 }
 
-func (h *handlerImpl) handle(writer dns.ResponseWriter, req *dns.Msg) (resp *dns.Msg) {
+func (h *handlerImpl) handle(writer dns.ResponseWriter, req *dns.Msg) *dns.Msg {
+	return h.handleRequest(context.Background(), writer, req, nil)
+}
+
+// Internal DoH bootstrap queries inherit cancellation from their parent request.
+func (h *handlerImpl) ServeDNSContext(ctx context.Context, writer dns.ResponseWriter, req *dns.Msg) {
+	resp := h.handleRequest(ctx, writer, req, nil)
+	if resp == nil {
+		resp = new(dns.Msg)
+	}
+	if !resp.Response {
+		resp.SetReply(req)
+	}
+	_ = writer.WriteMsg(resp)
+	_ = writer.Close()
+}
+
+func (h *handlerImpl) handleRequest(ctx context.Context, writer dns.ResponseWriter, req *dns.Msg, refresh *cacheRefresh) (resp *dns.Msg) {
+	if ctx.Err() != nil {
+		return nil
+	}
+	callGroup := func(group outbound.IGroup) *dns.Msg {
+		if contextual, ok := group.(interface {
+			HandleContext(context.Context, *dns.Msg) *dns.Msg
+		}); ok {
+			return contextual.HandleContext(ctx, req)
+		}
+		return group.Handle(req)
+	}
 	// region log
 	_info := struct {
 		blocked  bool
@@ -219,16 +263,23 @@ func (h *handlerImpl) handle(writer dns.ResponseWriter, req *dns.Msg) (resp *dns
 		_info.hitHosts = true
 		return resp
 	}
-	// Capture once: an in-flight old route can only populate its old namespace.
-	var revision uint64
-	for _, group := range h.groups {
-		if versioned, ok := group.(interface{ CacheRevision() uint64 }); ok {
-			revision += versioned.CacheRevision()
+	// Capture once: late old-route responses can only populate their old namespace.
+	revision := h.routingRevision()
+	if refresh != nil {
+		if refresh.revision != revision {
+			return nil
 		}
-	}
-	if resp = h.cache.Get(req, revision); resp != nil {
-		_info.hitCache = true
-		return resp
+		revision = refresh.revision
+	} else {
+		var refreshKey string
+		resp, refreshKey = h.cache.Lookup(req, revision)
+		if resp != nil {
+			_info.hitCache = true
+			if refreshKey != "" && h.refresh != nil {
+				h.refresh.schedule(refreshKey, req, revision)
+			}
+			return resp
+		}
 	}
 
 	// handle by matched group
@@ -236,13 +287,13 @@ func (h *handlerImpl) handle(writer dns.ResponseWriter, req *dns.Msg) (resp *dns
 	for _, group := range h.groups {
 		if group.Match(req) {
 			matched = group
-			resp = group.Handle(req)
+			resp = callGroup(group)
 			break
 		}
 	}
 	if matched == nil {
 		matched = h.fallbackGroup
-		resp = h.fallbackGroup.Handle(req)
+		resp = callGroup(h.fallbackGroup)
 		_info.fallback = true
 	}
 	_info.matched = matched
@@ -251,18 +302,33 @@ func (h *handlerImpl) handle(writer dns.ResponseWriter, req *dns.Msg) (resp *dns
 	if h.redirector != nil {
 		if group := h.redirector(matched, req, resp); group != nil {
 			matched = group
-			resp = group.Handle(req)
+			resp = callGroup(group)
 			_info.redirect = group
 		}
 	}
 
 	// finally
-	matched.PostProcess(req, resp)
+	if ctx.Err() != nil {
+		return nil
+	}
+	if contextual, ok := matched.(interface {
+		PostProcessContext(context.Context, *dns.Msg, *dns.Msg)
+	}); ok {
+		contextual.PostProcessContext(ctx, req, resp)
+	} else {
+		matched.PostProcess(req, resp)
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	h.cache.Set(req, resp, revision)
 	return resp
 }
 
 func (h *handlerImpl) start() {
+	if h.refresh != nil {
+		h.refresh.start(h)
+	}
 	for _, group := range h.groups {
 		group.Start(h)
 	}
@@ -272,6 +338,9 @@ func (h *handlerImpl) start() {
 
 func (h *handlerImpl) stop() {
 	logrus.Debugf("stop handler")
+	if h.refresh != nil {
+		h.refresh.stop()
+	}
 	for _, group := range h.groups {
 		group.Stop()
 	}

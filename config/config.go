@@ -15,9 +15,11 @@ type Conf struct {
 
 // CacheConf 配置文件中cache section对应的结构
 type CacheConf struct {
-	Size   int `toml:"size"`
-	MinTTL int `toml:"min_ttl"`
-	MaxTTL int `toml:"max_ttl"`
+	Size       int `toml:"size"`
+	MinTTL     int `toml:"min_ttl"`
+	MaxTTL     int `toml:"max_ttl"`
+	ServeStale int `toml:"serve_stale"`
+	StaleTTL   int `toml:"stale_ttl"`
 }
 
 // Group 配置文件中每个groups section对应的结构
@@ -32,6 +34,8 @@ type Group struct {
 	GFWListFile           string   `toml:"gfwlist_file"`
 	GFWListURL            string   `toml:"gfwlist_url"`
 	GFWListUpdateInterval string   `toml:"gfwlist_update_interval"`
+	GFWListProxy          string   `toml:"gfwlist_proxy"`
+	GFWListTimeout        string   `toml:"gfwlist_timeout"`
 	Fallback              bool     `toml:"fallback"`
 
 	Socks5 string   `toml:"socks5"`
