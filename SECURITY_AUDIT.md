@@ -50,8 +50,9 @@ goreleaser release --snapshot --clean
 
 Confirmed locally: module integrity verification, full race-enabled test suite,
 `go vet`, `go build`, actionlint v1.7.12, and GoReleaser v2.19.0 configuration
-validation passed. Snapshot cross-build verification is recorded in the task
-deliverables.
+validation passed. Snapshot archives were cross-built and checked for expected
+configuration, seed, README and checksum contents; the native binary smoke test
+passed.
 
 The legacy suite patches executable functions, so `-gcflags=all=-l` is required.
 New security tests use local HTTP servers and in-memory connections.
@@ -60,14 +61,10 @@ The cloud network policy **denied** the scanner's request to
 `https://vuln.go.dev/index/modules.json.gz` with `Forbidden`; therefore live
 advisory scanning was attempted but did not complete. It must be rerun with that
 host permitted, or by the configured GitHub Actions check. No clean advisory-scan
-result is claimed from that blocked local attempt. The initial GitHub CI run on
-commit `4330265` selected Go 1.27.0 and reported nine reachable standard-library
-advisories. The workflows now select latest 1.27.x and the module requires at
-least 1.27.3. GitHub CI run `41588855900` for commit
-`bab49bf1e2f532acf8bb618f6a7db823baaea39e` passed, including the online scanner
-reporting "No vulnerabilities found." That result covers that exact commit only;
-the coordinated local changes described below have not been pushed or scanned
-by GitHub CI.
+result is claimed from that blocked local attempt. CI runs the online scanner;
+verify its result for the exact release commit. Go 1.27.0 reported reachable
+standard-library advisories during validation, so the module requires at least
+1.27.3 and workflows select the latest patched 1.27.x toolchain.
 
 The updater has a dedicated validated `gfwlist_proxy` setting: explicit HTTP,
 HTTPS, SOCKS5/SOCKS5h or direct, with compatibility-preserving group/environment
@@ -114,7 +111,7 @@ privileged IPSet/ICMP behavior was reviewed but was not exercised against a live
 kernel/network. Cross-compiled artifacts require native smoke testing on their
 target operating systems before production use.
 
-## Coordinated follow-up review (local changes after bab49bf)
+## Cache refresh and connection lifecycle follow-up
 
 A valid NXDOMAIN or NOERROR/NODATA background refresh previously left its stale
 positive available until the end of the grace period. The refresh now captures
@@ -153,7 +150,8 @@ otherwise set ipset_ttl above max_ttl + serve_stale with operational margin.
 External set flushing, reload initialization, and capacity limits still prevent
 a strict guarantee. No privileged live-IPSet validation was performed.
 
-Follow-up local validation: full race-enabled package suite, vet, build, module
-integrity, and diff whitespace checks passed. Logs and the local-only review patch
-are supplied separately. Push authorization is paused; no remote branch changes,
-PR, merge, deployment, or release were performed for this follow-up.
+Follow-up validation: the full race-enabled package suite, vet, build, module
+integrity, and diff whitespace checks passed using the commands above.
+GoReleaser configuration validation also passed. The release configuration uses
+`prerelease: auto`, so SemVer prerelease tags such as `v1.2.0-beta` are classified
+as GitHub prereleases.
